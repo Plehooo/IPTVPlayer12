@@ -7,6 +7,7 @@ import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.projection.MediaProjection
 import android.os.Bundle
+import android.os.Process
 import java.nio.ByteBuffer
 
 class H264Encoder(
@@ -28,6 +29,11 @@ class H264Encoder(
     private var projectionCallback: MediaProjection.Callback? = null
     private var firstPtsUs = Long.MIN_VALUE
     private var firstWallNs = Long.MIN_VALUE
+    private var baseBitrate = 2_000_000
+    private var currentBitrate = 2_000_000
+    private var lateStreak = 0
+    private var healthySinceNs = Long.MIN_VALUE
+    private var lastBitrateChangeNs = 0L
 
     fun start() {
         check(!running) { "encoder already running" }
@@ -57,7 +63,16 @@ class H264Encoder(
         )
 
         running = true
-        thread = Thread { drainLoop() }.also { it.name = "A01-H264"; it.start() }
+        thread = Thread {
+            try {
+                Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY)
+            } catch (_: Throwable) {
+            }
+            drainLoop()
+        }.also {
+            it.name = "A01-H264"
+            it.start()
+        }
     }
 
     private fun buildFormat(strict: Boolean): MediaFormat =
@@ -72,6 +87,8 @@ class H264Encoder(
                 fps >= 30 -> 2_400_000
                 else -> 2_000_000
             }
+            baseBitrate = bitrate
+            currentBitrate = bitrate
             setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
@@ -170,15 +187,36 @@ class H264Encoder(
                                 val nowNs = System.nanoTime()
                                 val elapsedUs = ((nowNs - firstWallNs).coerceAtLeast(0L)) / 1_000L
 
-                                // MediaCodec/surface kadang menghasilkan beberapa frame lebih cepat
-                                // daripada realtime. Jangan kirim burst ke STB: burst membuat buffer DMR
-                                // penuh dan akibatnya gambar tertinggal beberapa detik.
+                                // Pacing mikro: jangan pernah membiarkan encoder memburst ke network,
+                                // tetapi juga jangan tidur lama karena itu sendiri bisa menambah latency.
+                                // Cukup tahan lead maksimal ~25 ms pada tiap output; sisanya dikejar
+                                // dengan frame dropping jika pipeline sudah tertinggal.
                                 val leadUs = normalizedPtsUs - elapsedUs
                                 if (leadUs > 0L) {
-                                    sleepMicros(leadUs)
-                                } else if (!isKey && elapsedUs - normalizedPtsUs > 120_000L) {
-                                    // Bila encoder/OS sudah tertinggal >120 ms, buang frame non-key
-                                    // agar stream kembali mengejar posisi live. Keyframe tetap dipertahankan.
+                                    sleepMicros(minOf(leadUs, 25_000L))
+                                }
+
+                                val lagUs = elapsedUs - normalizedPtsUs
+                                if (lagUs > 90_000L) {
+                                    lateStreak++
+                                    healthySinceNs = Long.MIN_VALUE
+                                } else {
+                                    lateStreak = 0
+                                    if (healthySinceNs == Long.MIN_VALUE) healthySinceNs = nowNs
+                                }
+
+                                // Jika HP mulai kehabisan headroom, turunkan bitrate secara dinamis.
+                                // Ini bukan mode kualitas permanen: hanya emergency governor agar queue
+                                // tidak berubah menjadi backlog. Setelah pipeline stabil, bitrate dipulihkan.
+                                maybeAdaptBitrate(c, lagUs, nowNs)
+
+                                if (!isKey && lagUs > 100_000L) {
+                                    try {
+                                        c.setParameters(Bundle().apply {
+                                            putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+                                        })
+                                    } catch (_: Throwable) {
+                                    }
                                     c.releaseOutputBuffer(index, false)
                                     continue
                                 }
@@ -194,6 +232,44 @@ class H264Encoder(
             } catch (t: Throwable) {
                 if (running) onFailure(t)
                 break
+            }
+        }
+    }
+
+    private fun maybeAdaptBitrate(c: MediaCodec, lagUs: Long, nowNs: Long) {
+        val tooLate = lateStreak >= 3 || lagUs >= 250_000L
+        if (tooLate && nowNs - lastBitrateChangeNs > 1_500_000_000L) {
+            val next = (currentBitrate * 0.75).toInt().coerceAtLeast(900_000)
+            if (next < currentBitrate) {
+                try {
+                    c.setParameters(Bundle().apply {
+                        putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, next)
+                    })
+                    currentBitrate = next
+                    lastBitrateChangeNs = nowNs
+                    healthySinceNs = Long.MIN_VALUE
+                } catch (_: Throwable) {
+                    lastBitrateChangeNs = nowNs
+                }
+            }
+            return
+        }
+
+        if (currentBitrate < baseBitrate &&
+            healthySinceNs != Long.MIN_VALUE &&
+            nowNs - healthySinceNs > 5_000_000_000L &&
+            nowNs - lastBitrateChangeNs > 5_000_000_000L
+        ) {
+            val next = minOf(baseBitrate, (currentBitrate * 1.20).toInt())
+            try {
+                c.setParameters(Bundle().apply {
+                    putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, next)
+                })
+                currentBitrate = next
+                lastBitrateChangeNs = nowNs
+                healthySinceNs = nowNs
+            } catch (_: Throwable) {
+                lastBitrateChangeNs = nowNs
             }
         }
     }

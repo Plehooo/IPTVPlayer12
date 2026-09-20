@@ -37,6 +37,7 @@ class MirrorService : Service() {
     private var renderer: DlnaController.Renderer? = null
     private var mirrorThread: Thread? = null
     private var wifiLock: android.net.wifi.WifiManager.WifiLock? = null
+    private var cpuWakeLock: android.os.PowerManager.WakeLock? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -66,7 +67,7 @@ class MirrorService : Service() {
 
             val target = DlnaController.Renderer(name, hostFrom(location), location, control, serviceType)
             renderer = target
-            acquireWifiLowLatency()
+            acquirePerformanceLocks()
 
             // Android 14+: permission/type requirements for a mediaProjection FGS are mandatory.
             startForeground(
@@ -161,7 +162,7 @@ class MirrorService : Service() {
         broadcaster = null
         try { projection?.stop() } catch (_: Exception) {}
         projection = null
-        releaseWifiLowLatency()
+        releasePerformanceLocks()
         stopForeground(STOP_FOREGROUND_REMOVE)
         super.onDestroy()
     }
@@ -169,7 +170,20 @@ class MirrorService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     @Suppress("DEPRECATION")
-    private fun acquireWifiLowLatency() {
+    private fun acquirePerformanceLocks() {
+        try {
+            val power = getSystemService(android.os.PowerManager::class.java)
+            cpuWakeLock = power.newWakeLock(
+                android.os.PowerManager.PARTIAL_WAKE_LOCK,
+                "A01Mirror::CapturePipeline"
+            ).apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        } catch (_: Exception) {
+            cpuWakeLock = null
+        }
+
         try {
             val manager = getSystemService(android.net.wifi.WifiManager::class.java)
             val lock = manager.createWifiLock(
@@ -185,12 +199,18 @@ class MirrorService : Service() {
     }
 
     @Suppress("DEPRECATION")
-    private fun releaseWifiLowLatency() {
+    private fun releasePerformanceLocks() {
         try {
             wifiLock?.let { if (it.isHeld) it.release() }
         } catch (_: Exception) {
         }
         wifiLock = null
+
+        try {
+            cpuWakeLock?.let { if (it.isHeld) it.release() }
+        } catch (_: Exception) {
+        }
+        cpuWakeLock = null
     }
 
     private fun buildNotification(text: String): Notification {

@@ -15,6 +15,7 @@ import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
+import android.os.Process
 import java.nio.charset.StandardCharsets
 import java.text.SimpleDateFormat
 import java.util.Collections
@@ -26,6 +27,7 @@ import java.util.concurrent.CopyOnWriteArrayList
 
 /** 188 * 32 byte, sama dengan ukuran baca ffmpeg->TS di tar v6. */
 private const val TS_CHUNK_BYTES = 188 * 32
+private val CRLF = byteArrayOf(13, 10)
 
 class TsBroadcaster(
     private val resolver: ContentResolver
@@ -35,6 +37,7 @@ class TsBroadcaster(
     private var output: OutputStream? = null
     private var pendingUri = android.net.Uri.EMPTY
     private var lastTablesNs = 0L
+    @Volatile private var latestKeyFrameTs: ByteArray? = null
     private var recordingFailed = false
     private val recordingQueue = ArrayBlockingQueue<ByteArray>(256)
     @Volatile private var recordingRunning = false
@@ -55,30 +58,32 @@ class TsBroadcaster(
 
     @Synchronized
     fun publishVideo(accessUnit: ByteArray, pts90k: Long, keyFrame: Boolean) {
-        publish(muxer.videoPes(accessUnit, pts90k, keyFrame))
+        val packet = muxer.videoPes(accessUnit, pts90k, keyFrame)
+        if (keyFrame) latestKeyFrameTs = packet
+        publish(packet, keyFrame)
         videoFrames += 1
     }
 
     @Synchronized
     fun publishAudio(mp3: ByteArray, pts90k: Long) {
-        if (mp3.isNotEmpty()) publish(muxer.audioPes(mp3, pts90k))
+        if (mp3.isNotEmpty()) publish(muxer.audioPes(mp3, pts90k), false)
     }
 
     @Synchronized
-    private fun publish(packet: ByteArray) {
+    private fun publish(packet: ByteArray, keyFrame: Boolean) {
         if (packet.isEmpty()) return
         bytesPublished += packet.size
         if (System.nanoTime() - lastTablesNs >= 250_000_000L) {
             writeRecording(muxer.patPacket())
             writeRecording(muxer.pmtPacket())
-            broadcast(muxer.patPacket())
-            broadcast(muxer.pmtPacket())
+            broadcast(muxer.patPacket(), true)
+            broadcast(muxer.pmtPacket(), true)
             lastTablesNs = System.nanoTime()
         }
         // Jalur LIVE tidak boleh menunggu penulisan file. Rekaman ditangani thread terpisah
         // agar I/O MediaStore tidak menahan encoder/stream ketika storage sedang lambat.
         writeRecording(packet)
-        broadcast(packet)
+        broadcast(packet, keyFrame)
     }
 
     private fun writeRecording(data: ByteArray) {
@@ -115,9 +120,9 @@ class TsBroadcaster(
         }
     }
 
-    private fun broadcast(data: ByteArray) {
+    private fun broadcast(data: ByteArray, keyFrame: Boolean) {
         for (client in clients) {
-            if (!client.offer(data)) {
+            if (!client.offer(data, keyFrame)) {
                 client.close()
                 clients.remove(client)
             }
@@ -133,10 +138,17 @@ class TsBroadcaster(
             socket.receiveBufferSize = 32 * 1024
         } catch (_: Exception) {
         }
+        try { socket.trafficClass = 0x10 } catch (_: Exception) {}
         val client = Client(socket, outputStream)
-        if (!client.offer(muxer.patPacket()) || !client.offer(muxer.pmtPacket())) {
+        if (!client.offer(muxer.patPacket(), true) || !client.offer(muxer.pmtPacket(), true)) {
             client.close()
             return
+        }
+        latestKeyFrameTs?.let { key ->
+            if (!client.offer(key, true)) {
+                client.close()
+                return
+            }
         }
         clients.add(client)
         client.start()
@@ -200,44 +212,60 @@ class TsBroadcaster(
         private val socket: Socket,
         private val output: OutputStream
     ) {
-        // Antrean kecil menjaga stream tetap dekat realtime. Bila jaringan/STB tertinggal,
-        // buang paket paling lama daripada menumpuk beberapa detik latency.
-        private val queue = ArrayBlockingQueue<ByteArray>(4)
+        private data class QueuedPacket(
+            val data: ByteArray,
+            val keyFrame: Boolean,
+            val enqueuedNs: Long
+        )
+
+        // Tetap 4 slot seperti versi sebelumnya, tetapi sekarang setiap item membawa timestamp.
+        // Queue penuh tidak boleh berubah menjadi buffer beberapa detik.
+        private val queue = ArrayBlockingQueue<QueuedPacket>(4)
         @Volatile private var closed = false
         private var writer: Thread? = null
+        private val maxPacketAgeNs = 180_000_000L
 
-        fun offer(bytes: ByteArray): Boolean {
+        fun offer(bytes: ByteArray, keyFrame: Boolean): Boolean {
             if (closed) return false
-            if (queue.offer(bytes)) return true
-            // Prioritaskan data terbaru agar mirror tidak berubah menjadi delayed playback.
-            repeat(4) {
-                queue.poll() ?: return@repeat
-                if (queue.offer(bytes)) return true
+            val item = QueuedPacket(bytes, keyFrame, System.nanoTime())
+            if (queue.offer(item)) return true
+
+            // Keyframe adalah titik recovery decoder: bila datang, buang backlog lama dan mulai
+            // dari keyframe baru. Untuk frame biasa, cukup buang frame baru agar queue tidak membesar.
+            if (keyFrame) {
+                queue.clear()
+                return queue.offer(item)
             }
-            return queue.offer(bytes)
+            return true
         }
 
         fun start() {
             writer = Thread {
                 try {
+                    Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY)
+                } catch (_: Throwable) {
+                }
+                try {
                     while (!closed) {
-                        val packet = queue.take()
-                        // HTTP/1.1 chunked seperti send_chunk() di tar v6. Frame video besar dipotong
-                        // per 188*32 byte (kelipatan paket TS) seperti p.stdout.read(188*32) di tar,
-                        // supaya STB dengan buffer kecil tidak tersedak chunk ratusan KB.
+                        val queued = queue.take()
+                        val age = System.nanoTime() - queued.enqueuedNs
+                        if (!queued.keyFrame && age > maxPacketAgeNs) {
+                            continue
+                        }
+                        val packet = queued.data
                         var offset = 0
                         while (offset < packet.size) {
                             val len = minOf(TS_CHUNK_BYTES, packet.size - offset)
                             val head = (Integer.toHexString(len) + "\r\n").toByteArray(StandardCharsets.US_ASCII)
-                            val frame = ByteArray(head.size + len + 2)
-                            System.arraycopy(head, 0, frame, 0, head.size)
-                            System.arraycopy(packet, offset, frame, head.size, len)
-                            frame[frame.size - 2] = 13
-                            frame[frame.size - 1] = 10
-                            output.write(frame)
+                            // Hindari membuat ByteArray gabungan baru pada setiap chunk: lebih sedikit
+                            // allocation/GC berarti encoder lebih kecil kemungkinannya tersendat saat
+                            // aplikasi berat dibuka.
+                            output.write(head)
+                            output.write(packet, offset, len)
+                            output.write(CRLF)
+                            output.flush()
                             offset += len
                         }
-                        output.flush()
                     }
                 } catch (_: InterruptedException) {
                     Thread.currentThread().interrupt()
