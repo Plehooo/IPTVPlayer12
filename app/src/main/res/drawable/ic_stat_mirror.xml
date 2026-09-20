@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Ikon notifikasi (satu warna, dipakai sistem sebagai mask). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group
+        android:pivotX="54"
+        android:pivotY="54"
+        android:scaleX="1.6"
+        android:scaleY="1.6">
+        <path
+            android:pathData="M32,37h44a4,4 0 0,1 4,4v24a4,4 0 0,1 -4,4h-44a4,4 0 0,1 -4,-4v-24a4,4 0 0,1 4,-4z"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeWidth="4.4"
+            android:strokeLineJoin="round" />
+        <path
+            android:pathData="M38,61m-3,0a3,3 0 1,0 6,0a3,3 0 1,0 -6,0z"
+            android:fillColor="#FFFFFFFF" />
+        <path
+            android:pathData="M38,52a9,9 0 0,1 9,9"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeWidth="4"
+            android:strokeLineCap="round" />
+        <path
+            android:pathData="M70,61m-3,0a3,3 0 1,0 6,0a3,3 0 1,0 -6,0z"
+            android:fillColor="#FFFFFFFF" />
+        <path
+            android:pathData="M70,52a9,9 0 0,0 -9,9"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeWidth="4"
+            android:strokeLineCap="round" />
+    </group>
+</vector>

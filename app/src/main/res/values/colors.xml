@@ -1,4 +1,7 @@
 <resources>
     <color name="black">#000000</color>
     <color name="white">#FFFFFF</color>
+    <color name="a01_bg">#0E1120</color>
+    <color name="a01_card">#181D36</color>
+    <color name="a01_accent">#5C6BF0</color>
 </resources>

@@ -18,6 +18,10 @@ class MpegTsMuxer {
         private const val AUDIO_PID = 0x0101
         private const val PROGRAM_NUMBER = 1
         private const val PES_HEADER_SIZE = 14
+
+        // PCR dibuat 180 ms lebih awal dari PTS supaya decoder STB punya bantalan
+        // (PTS - PCR > 0) dan tidak menampilkan frame "terlambat" saat jaringan bergetar.
+        private const val PCR_LEAD_90K = 16_200L
     }
 
     private val continuity = HashMap<Int, Int>()
@@ -102,7 +106,8 @@ class MpegTsMuxer {
         val safePts = pts90k.coerceAtLeast(0L)
         val pesBytes = PES_HEADER_SIZE + payload.size
         val packetCount = countPackets(pesBytes, includePcr)
-        val out = ByteArray(packetCount * TS_SIZE) { 0xFF.toByte() }
+        val out = ByteArray(packetCount * TS_SIZE)
+        java.util.Arrays.fill(out, 0xFF.toByte())
 
         var pesPos = 0
         for (packetIndex in 0 until packetCount) {
@@ -141,7 +146,7 @@ class MpegTsMuxer {
                 out[packetOff + 5] = flags.toByte()
                 var cursor = packetOff + 6
                 if (hasPcr) {
-                    writePcr(out, cursor, safePts)
+                    writePcr(out, cursor, (safePts - PCR_LEAD_90K).coerceAtLeast(0L))
                     cursor += 6
                 }
                 val stuffingEnd = packetOff + 4 + adaptationBytes
@@ -202,8 +207,9 @@ class MpegTsMuxer {
         val lengthValue = if (streamId in 0xE0..0xEF) 0 else (3 + 5 + payloadSize).coerceAtMost(0xFFFF)
         out[off + 4] = (lengthValue shr 8).toByte()
         out[off + 5] = lengthValue.toByte()
-        out[off + 6] = 0x80.toByte()
-        out[off + 7] = (0x80 or if (streamId in 0xE0..0xEF) 0x04 else 0x00).toByte()
+        // Byte 6: marker '10' + data_alignment_indicator (0x04). Byte 7: hanya flag PTS (0x80).
+        out[off + 6] = 0x84.toByte()
+        out[off + 7] = 0x80.toByte()
         out[off + 8] = 0x05
         writePts(out, off + 9, pts90k)
     }

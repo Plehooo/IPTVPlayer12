@@ -9,6 +9,7 @@ import android.media.MediaFormat
 import android.media.projection.MediaProjection
 import android.os.Build
 import android.os.Bundle
+import android.os.Process
 import java.nio.ByteBuffer
 
 class H264Encoder(
@@ -38,14 +39,14 @@ class H264Encoder(
     private var lastSyncRequestNs = 0L
     private var lastClientDrops = 0L
     private var recoveries = 0
-    private var videoPtsOffset90k = 0L
+    private var anchorNs = 0L
     private var lastVideoPts90k = -1L
+    private val aud = byteArrayOf(0, 0, 0, 1, 0x09, 0xF0.toByte())
 
     @Synchronized
     fun start() {
         check(!running) { "encoder already running" }
         resetClock()
-        videoPtsOffset90k = 0L
         lastVideoPts90k = -1L
         codec = createConfiguredCodec()
         inputSurface = codec!!.createInputSurface()
@@ -72,6 +73,8 @@ class H264Encoder(
 
         running = true
         thread = Thread {
+            // Thread encoder diberi prioritas tinggi supaya frame tetap mengalir saat aplikasi berat berjalan.
+            try { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY) } catch (_: Throwable) {}
             drainLoop()
         }.also {
             it.name = "A01-H264"
@@ -227,6 +230,10 @@ class H264Encoder(
         while (running) {
             try {
                 val c = codec ?: break
+                // Klien STB baru / antrean kirim macet meminta IDR baru (resync bersih, bukan buang P-frame).
+                if (broadcaster.consumeKeyFrameRequest()) {
+                    if (!requestSyncFrame(c, System.nanoTime(), 250_000_000L)) broadcaster.requestKeyFrame()
+                }
                 when (val index = c.dequeueOutputBuffer(info, 10_000)) {
                     MediaCodec.INFO_TRY_AGAIN_LATER -> Unit
                     MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
@@ -255,6 +262,11 @@ class H264Encoder(
                                     if (firstPtsUs == Long.MIN_VALUE) {
                                         firstPtsUs = rawPtsUs
                                         firstWallNs = System.nanoTime()
+                                        // Timestamp Surface memakai jam monotonic yang sama dengan System.nanoTime();
+                                        // bila vendor memakai jam lain (selisih > 2 dtk) pakai jam dinding.
+                                        val captureNs = rawPtsUs * 1000L
+                                        val skew = if (captureNs > firstWallNs) captureNs - firstWallNs else firstWallNs - captureNs
+                                        anchorNs = if (skew < 2_000_000_000L) captureNs else firstWallNs
                                     }
 
                                     val normalizedPtsUs = (rawPtsUs - firstPtsUs).coerceAtLeast(0L)
@@ -275,13 +287,12 @@ class H264Encoder(
                                     lastClientDrops = clientDrops
                                     maybeAdaptBitrate(c, lagUs, nowNs, networkPressure)
 
-                                    if (!isKey && lagUs > 120_000L) {
-                                        requestSyncFrame(c, nowNs)
-                                        continue
-                                    }
-
-                                    val packet = if (isKey) prefixConfig(annexB) else annexB
-                                    val pts = videoPtsOffset90k + (normalizedPtsUs * 90L / 1000L)
+                                    // Frame P tidak lagi dibuang di sini (membuat blok artefak). Kalau jaringan
+                                    // tak sanggup, lapisan kirim yang meminta IDR baru dan resync bersih.
+                                    val packet = buildAccessUnit(annexB, isKey)
+                                    val ptsNs = (anchorNs - broadcaster.clockOriginNs) + normalizedPtsUs * 1000L
+                                    var pts = ptsNs.coerceAtLeast(0L) * 9L / 100_000L
+                                    if (pts <= lastVideoPts90k) pts = lastVideoPts90k + 1L
                                     lastVideoPts90k = pts
                                     broadcaster.publishVideo(packet, pts, isKey)
                                 }
@@ -304,8 +315,8 @@ class H264Encoder(
         }
     }
 
-    private fun requestSyncFrame(c: MediaCodec, nowNs: Long) {
-        if (nowNs - lastSyncRequestNs <= 700_000_000L) return
+    private fun requestSyncFrame(c: MediaCodec, nowNs: Long, minGapNs: Long = 700_000_000L): Boolean {
+        if (nowNs - lastSyncRequestNs <= minGapNs) return false
         try {
             c.setParameters(Bundle().apply {
                 putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
@@ -313,6 +324,7 @@ class H264Encoder(
         } catch (_: Throwable) {
         }
         lastSyncRequestNs = nowNs
+        return true
     }
 
     private fun maybeAdaptBitrate(c: MediaCodec, lagUs: Long, nowNs: Long, networkPressure: Boolean) {
@@ -377,9 +389,6 @@ class H264Encoder(
             inputSurface = replacementSurface
             virtualDisplay?.setSurface(replacementSurface)
 
-            if (lastVideoPts90k >= 0L) {
-                videoPtsOffset90k = lastVideoPts90k + (90_000L / fps.coerceAtLeast(1))
-            }
             sps = null
             pps = null
             resetClock()
@@ -460,20 +469,49 @@ class H264Encoder(
         return null to null
     }
 
-    private fun prefixConfig(annexB: ByteArray): ByteArray {
-        val s = sps ?: return annexB
-        val p = pps ?: return annexB
-        val sc = 4
-        val out = ByteArray(sc + s.size + sc + p.size + annexB.size)
+    /**
+     * Susun satu access unit sesuai kebiasaan ffmpeg (tar v6): AUD di depan, lalu SPS/PPS
+     * sebelum setiap IDR. AUD membantu decoder STB murahan menemukan batas frame.
+     */
+    private fun buildAccessUnit(input: ByteArray, isKey: Boolean): ByteArray {
+        val annexB = stripLeadingAud(input)
+        val s = sps
+        val p = pps
+        val addConfig = isKey && s != null && p != null && firstNalType(annexB) != 7
+        val configSize = if (addConfig && s != null && p != null) 8 + s.size + p.size else 0
+        val out = ByteArray(aud.size + configSize + annexB.size)
         var pos = 0
-        out[pos++] = 0; out[pos++] = 0; out[pos++] = 0; out[pos++] = 1
-        System.arraycopy(s, 0, out, pos, s.size)
-        pos += s.size
-        out[pos++] = 0; out[pos++] = 0; out[pos++] = 0; out[pos++] = 1
-        System.arraycopy(p, 0, out, pos, p.size)
-        pos += p.size
+        System.arraycopy(aud, 0, out, pos, aud.size)
+        pos += aud.size
+        if (configSize > 0 && s != null && p != null) {
+            out[pos++] = 0; out[pos++] = 0; out[pos++] = 0; out[pos++] = 1
+            System.arraycopy(s, 0, out, pos, s.size)
+            pos += s.size
+            out[pos++] = 0; out[pos++] = 0; out[pos++] = 0; out[pos++] = 1
+            System.arraycopy(p, 0, out, pos, p.size)
+            pos += p.size
+        }
         System.arraycopy(annexB, 0, out, pos, annexB.size)
         return out
+    }
+
+    /** Buang AUD bawaan encoder (bila ada) supaya tidak ganda dengan AUD buatan kita. */
+    private fun stripLeadingAud(data: ByteArray): ByteArray {
+        val start = findStartCode(data, 0)
+        if (start < 0) return data
+        val codeLen = if (start + 2 < data.size && data[start + 2].toInt() == 1) 3 else 4
+        val nalStart = start + codeLen
+        if (nalStart >= data.size || (data[nalStart].toInt() and 0x1F) != 9) return data
+        val next = findStartCode(data, nalStart)
+        return if (next >= 0) data.copyOfRange(next, data.size) else data
+    }
+
+    private fun firstNalType(data: ByteArray): Int {
+        val start = findStartCode(data, 0)
+        if (start < 0) return -1
+        val codeLen = if (start + 2 < data.size && data[start + 2].toInt() == 1) 3 else 4
+        val index = start + codeLen
+        return if (index < data.size) data[index].toInt() and 0x1F else -1
     }
 
     private fun normalizeH264(data: ByteArray): ByteArray {
@@ -544,12 +582,18 @@ class H264Encoder(
         return -1
     }
 
+    /** Hanya memeriksa beberapa NAL pertama (AUD/SEI/SPS/PPS lalu slice) — tidak memindai seluruh frame. */
     private fun containsIdrFast(data: ByteArray): Boolean {
         var start = findStartCode(data, 0)
-        while (start >= 0) {
+        var guard = 0
+        while (start >= 0 && guard++ < 8) {
             val codeLen = if (start + 2 < data.size && data[start + 2].toInt() == 1) 3 else 4
             val nalStart = start + codeLen
-            if (nalStart < data.size && (data[nalStart].toInt() and 0x1F) == 5) return true
+            if (nalStart >= data.size) return false
+            when (data[nalStart].toInt() and 0x1F) {
+                5 -> return true
+                1 -> return false
+            }
             start = findStartCode(data, nalStart)
         }
         return false

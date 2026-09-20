@@ -39,7 +39,7 @@ git push -u origin main
 3. Open GitHub → **Actions** → **Build A01 Mirror APK**.
 4. Open the successful workflow run and download the `A01Mirror-debug` artifact.
 
-The workflow deliberately pins AGP 9.4.0, Gradle 9.6 and JDK 17. AGP 9.4 lists Gradle 9.6 and JDK 17 as its default compatibility versions. See the official Android Gradle Plugin 9.4 release notes.
+The workflow deliberately pins AGP 9.4.0, Gradle 9.7.1 and JDK 17. See the official Android Gradle Plugin 9.4 release notes.
 
 ## Android build configuration
 
@@ -82,3 +82,21 @@ TAndroidLame is a GPL-3.0 project and uses native code. Verify its license oblig
 - Live client queues keep fresh data and can recover from codec resets without recreating MediaProjection.
 - Recording I/O is isolated from the live path and bounded under memory pressure.
 - HTTP semantics intentionally match the working Advance A01 v6 server more closely.
+
+
+## Update 1.1.0 (stabil saat aplikasi berat)
+
+Struktur file/kelas tidak berubah; yang diperbaiki:
+
+- **Service satu proses dengan UI** (`android:process` dihapus) dan `DlnaController.setDiscoveryContext()` juga dipanggil di service. Sebelumnya SOAP `SetAVTransportURI`/`Play` di service tidak diikat ke jaringan Wi-Fi, dan tombol **Log DLNA** tidak menampilkan SOAP Play.
+- **Error selalu terlihat**: Toast lewat thread utama, notifikasi error terpisah yang tetap ada setelah service berhenti, dan status/pesan error tampil di layar utama.
+- **Klien STB baru** tidak lagi mendapat IDR lama + P-frame baru (artefak ±1 dtk). Klien menunggu IDR baru yang diminta ke encoder; IDR tersimpan hanya dipakai bila belum ada P-frame sesudahnya. Tidak ada lagi penulisan socket yang memblokir lock broadcaster.
+- **Jaringan tersendat / CPU sibuk**: antrean kirim lebih dalam (96 paket), frame P tidak dibuang satu-satu. Bila klien terlalu tertinggal, antrean dikosongkan dan resync bersih di IDR berikutnya (encoder membuat IDR atas permintaan). Pacing 2,5x bitrate, buffer kirim 64 KB.
+- **Prioritas thread**: encoder `URGENT_DISPLAY`, audio `URGENT_AUDIO`, penulis klien `DISPLAY`, penulis rekaman normal (bukan background). Wi-Fi lock low-latency + high-perf.
+- **Spesifikasi TS**: PES header (`data_alignment` di byte 6), AUD sebelum tiap frame, SPS/PPS + PAT/PMT sebelum tiap IDR, PCR 180 ms sebelum PTS.
+- **Sinkron A/V**: PTS video dan audio memakai jam yang sama (`TsBroadcaster.clockOriginNs`).
+- **Rekaman**: antrean 32 MB, tidak mati permanen saat disk lambat (celah kecil lalu lanjut di IDR berikutnya), mulai tepat di IDR, ekor rekaman dikuras saat Stop, status rekaman nyata di UI dan notifikasi.
+- **UI baru** (kartu gelap, logo, status LIVE, statistik live, tombol Izin baterai), ikon launcher adaptif + ikon notifikasi, izin notifikasi Android 13+.
+- Capture audio kini juga menangkap `USAGE_UNKNOWN`.
+
+Untuk Redmi/HyperOS: buka **Izin baterai** dan set A01 Mirror ke *Tanpa batasan*; pakai 720p 25/30 fps.

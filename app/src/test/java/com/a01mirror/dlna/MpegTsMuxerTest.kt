@@ -34,6 +34,27 @@ class MpegTsMuxerTest {
     }
 
     @Test
+    fun videoPesHeaderFlagsFollowSpec() {
+        val muxer = MpegTsMuxer()
+        val data = muxer.videoPes(byteArrayOf(0, 0, 0, 1, 0x65, 1, 2, 3, 4), 180000L, true)
+
+        var index = -1
+        for (i in 0 until 180) {
+            if (data[i] == 0.toByte() && data[i + 1] == 0.toByte() &&
+                data[i + 2] == 1.toByte() && data[i + 3] == 0xE0.toByte()
+            ) {
+                index = i
+                break
+            }
+        }
+        assertTrue(index > 0)
+        // data_alignment_indicator di byte 6, hanya flag PTS di byte 7, panjang header 5.
+        assertEquals(0x84.toByte(), data[index + 6])
+        assertEquals(0x80.toByte(), data[index + 7])
+        assertEquals(5.toByte(), data[index + 8])
+    }
+
+    @Test
     fun audioPesIs188ByteAligned() {
         val muxer = MpegTsMuxer()
         val mp3 = ByteArray(500) { 0x55.toByte() }

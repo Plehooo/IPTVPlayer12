@@ -5,6 +5,7 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.media.projection.MediaProjection
+import android.os.Process
 import com.naman14.androidlame.AndroidLame
 import com.naman14.androidlame.LameBuilder
 
@@ -92,14 +93,18 @@ class AudioCapture(
     private fun loop() {
         val rec = record ?: return
         val enc = lame ?: return
-        // Dua frame MP3 per pembacaan (~48 ms pada 48 kHz), agar audio tidak menambah latency besar.
+        // Satu frame MP3 (1152 sampel ~ 24 ms pada 48 kHz) per pembacaan, agar audio tidak menambah latency.
         val framesPerRead = 1152
         val pcm = ShortArray(framesPerRead * channels)
         val mp3 = ByteArray(7200 + pcm.size * 2)
         var samplesPerChannel = 0L
 
         try {
+            // Audio tidak boleh tersendat walau game/aplikasi berat sedang memakai CPU.
+            try { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO) } catch (_: Throwable) {}
             rec.startRecording()
+            // Jangkar waktu bersama dengan video (jam broadcaster) supaya lip-sync tidak bergeser.
+            val anchor90k = (System.nanoTime() - broadcaster.clockOriginNs).coerceAtLeast(0L) * 9L / 100_000L
             while (running) {
                 val shorts = rec.read(pcm, 0, pcm.size, AudioRecord.READ_BLOCKING)
                 if (shorts <= 0) continue
@@ -107,14 +112,14 @@ class AudioCapture(
                 val encoded = enc.encodeBufferInterLeaved(pcm, perChannel, mp3)
                 if (encoded > 0) {
                     val bytes = mp3.copyOf(encoded)
-                    val pts = samplesPerChannel * 90000L / sampleRate
+                    val pts = anchor90k + samplesPerChannel * 90000L / sampleRate
                     broadcaster.publishAudio(bytes, pts)
                 }
                 samplesPerChannel += perChannel
             }
             val flushed = enc.flush(mp3)
             if (flushed > 0) {
-                broadcaster.publishAudio(mp3.copyOf(flushed), samplesPerChannel * 90000L / sampleRate)
+                broadcaster.publishAudio(mp3.copyOf(flushed), anchor90k + samplesPerChannel * 90000L / sampleRate)
             }
         } catch (t: Throwable) {
             if (running) onFailure(t)
@@ -127,5 +132,6 @@ private object AudioPlaybackCaptureConfigurationCompat {
         android.media.AudioPlaybackCaptureConfiguration.Builder(projection)
             .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
             .addMatchingUsage(AudioAttributes.USAGE_GAME)
+            .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
             .build()
 }

@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Logo A01 Mirror: layar TV + gelombang cast yang saling mencerminkan di tengah. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Bingkai layar -->
+    <path
+        android:pathData="M32,37h44a4,4 0 0,1 4,4v24a4,4 0 0,1 -4,4h-44a4,4 0 0,1 -4,-4v-24a4,4 0 0,1 4,-4z"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="3.6"
+        android:strokeLineJoin="round" />
+    <!-- Kaki layar -->
+    <path
+        android:pathData="M54,69v8M44,77h20"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="3.6"
+        android:strokeLineCap="round" />
+    <!-- Sisi kiri (sumber) -->
+    <path
+        android:pathData="M38,61m-2.4,0a2.4,2.4 0 1,0 4.8,0a2.4,2.4 0 1,0 -4.8,0z"
+        android:fillColor="#FF4DD0E1" />
+    <path
+        android:pathData="M38,53a8,8 0 0,1 8,8"
+        android:strokeColor="#FF4DD0E1"
+        android:strokeWidth="3.2"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M38,45a16,16 0 0,1 16,16"
+        android:strokeColor="#FF4DD0E1"
+        android:strokeWidth="3.2"
+        android:strokeLineCap="round" />
+    <!-- Sisi kanan (cermin) -->
+    <path
+        android:pathData="M70,61m-2.4,0a2.4,2.4 0 1,0 4.8,0a2.4,2.4 0 1,0 -4.8,0z"
+        android:fillColor="#B3FFFFFF" />
+    <path
+        android:pathData="M70,53a8,8 0 0,0 -8,8"
+        android:strokeColor="#B3FFFFFF"
+        android:strokeWidth="3.2"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M70,45a16,16 0 0,0 -16,16"
+        android:strokeColor="#B3FFFFFF"
+        android:strokeWidth="3.2"
+        android:strokeLineCap="round" />
+</vector>
