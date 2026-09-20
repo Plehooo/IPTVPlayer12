@@ -107,17 +107,18 @@ class MirrorService : Service() {
 
             mirrorThread = Thread {
                 try {
-                    // Sama seperti /api/media/play di tar v6: jangan suruh STB Play sebelum
-                    // ada data TS (frame video pertama) supaya tidak layar hitam / loading lama.
-                    val deadline = System.currentTimeMillis() + 8000L
+                    // Jangan menunggu berlebihan: server sudah mengirim PAT/PMT saat STB connect,
+                    // lalu cukup pastikan frame video pertama sudah tersedia sebelum Play.
+                    val deadline = System.currentTimeMillis() + 1800L
                     while (System.currentTimeMillis() < deadline && stream.videoFrames < 1L) {
-                        Thread.sleep(100)
+                        Thread.sleep(30)
                     }
-                    // Jeda kepala dari versi A01-DLNA-FIXED: beri STB sempat menerima PAT/PMT + IDR pertama.
-                    Thread.sleep(1200)
+                    // Buffer awal pendek: cukup untuk melewatkan PAT/PMT + IDR pertama tanpa menambah
+                    // detik latency seperti versi sebelumnya.
+                    Thread.sleep(140)
                     val r = renderer
                     if (r != null && streamUrl.startsWith("http://") && !streamUrl.startsWith("http://127.")) {
-                        val result = DlnaController.playLive(r, streamUrl)
+                        val result = DlnaController.playLive(r, streamUrl, "${width}x${height}")
                         if (result.isSuccess) {
                             val state = DlnaController.lastTransportState
                             updateNotification(

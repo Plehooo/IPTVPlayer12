@@ -92,7 +92,8 @@ class AudioCapture(
     private fun loop() {
         val rec = record ?: return
         val enc = lame ?: return
-        val framesPerRead = 1152 * 4
+        // Dua frame MP3 per pembacaan (~48 ms pada 48 kHz), agar audio tidak menambah latency besar.
+        val framesPerRead = 1152 * 2
         val pcm = ShortArray(framesPerRead * channels)
         val mp3 = ByteArray(7200 + pcm.size * 2)
         var samplesPerChannel = 0L

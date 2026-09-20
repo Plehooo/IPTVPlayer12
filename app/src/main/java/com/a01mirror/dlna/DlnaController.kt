@@ -181,7 +181,11 @@ object DlnaController {
      * jeda 0.7 dtk -> GetTransportInfo). Bila ditolak dicoba ulang dengan Stop defensif, tipe
      * service alternatif, dan variasi metadata (tar, profil DLNA, tanpa metadata).
      */
-    fun playLive(renderer: Renderer, streamUrl: String): Result<Unit> {
+    fun playLive(
+        renderer: Renderer,
+        streamUrl: String,
+        streamResolution: String = ""
+    ): Result<Unit> {
         if (renderer.avTransportControlUrl.isBlank()) {
             return Result.failure(IllegalStateException("AVTransport tidak tersedia"))
         }
@@ -195,8 +199,8 @@ object DlnaController {
         }
 
         val metadataAttempts = listOf(
-            didlMetadata(streamUrl),
-            didlMetadataProfile(streamUrl),
+            didlMetadata(streamUrl, streamResolution),
+            didlMetadataProfile(streamUrl, streamResolution),
             ""
         )
         var lastError: Throwable? = null
@@ -219,14 +223,14 @@ object DlnaController {
                                 "<CurrentURI>${xml(streamUrl)}</CurrentURI>" +
                                 "<CurrentURIMetaData>${xml(metadata)}</CurrentURIMetaData>"
                         )
-                        Thread.sleep(500)
+                        Thread.sleep(220)
                         soap(
                             renderer.avTransportControlUrl,
                             serviceType,
                             "Play",
                             "<InstanceID>0</InstanceID><Speed>1</Speed>"
                         )
-                        Thread.sleep(700)
+                        Thread.sleep(260)
                         lastTransportState = transportState(renderer, serviceType)
                         return Result.success(Unit)
                     } catch (t: Throwable) {
@@ -962,15 +966,16 @@ object DlnaController {
     }
 
     /** Metadata satu baris, persis seperti metadata_for() di tar v6 (tanpa DLNA.ORG_PN). */
-    private fun didlMetadata(url: String): String {
+    private fun didlMetadata(url: String, resolution: String = ""): String {
         val protocolInfo = "http-get:*:video/mpeg:$DLNA_FEATURES"
+        val resolutionAttr = if (resolution.isNotBlank()) " resolution=\"${xml(resolution)}\"" else ""
         return "<DIDL-Lite xmlns:dc=\"http://purl.org/dc/elements/1.1/\" " +
             "xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\" " +
             "xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\">" +
             "<item id=\"1\" parentID=\"0\" restricted=\"1\">" +
             "<dc:title>A01 Mirror Live</dc:title>" +
             "<upnp:class>object.item.videoItem</upnp:class>" +
-            "<res protocolInfo=\"${xml(protocolInfo)}\">${xml(url)}</res>" +
+            "<res protocolInfo=\"${xml(protocolInfo)}\"$resolutionAttr>${xml(url)}</res>" +
             "</item></DIDL-Lite>"
     }
 
@@ -978,16 +983,17 @@ object DlnaController {
      * Variasi cadangan (dari versi A01-DLNA-FIXED): stream H.264 + MPEG-1 Layer III dalam TS 188-byte
      * memakai profil DLNA AVC_TS_MP_HD_MPEG1_L3. Dipakai bila metadata gaya tar ditolak firmware.
      */
-    private fun didlMetadataProfile(url: String): String {
+    private fun didlMetadataProfile(url: String, resolution: String = ""): String {
         val protocolInfo =
             "http-get:*:video/mpeg:DLNA.ORG_PN=AVC_TS_MP_HD_MPEG1_L3;DLNA.ORG_OP=00;DLNA.ORG_CI=0"
+        val resolutionAttr = if (resolution.isNotBlank()) " resolution=\"${xml(resolution)}\"" else ""
         return "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" " +
             "xmlns:dc=\"http://purl.org/dc/elements/1.1/\" " +
             "xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">" +
             "<item id=\"1\" parentID=\"-1\" restricted=\"1\">" +
             "<dc:title>A01 Mirror Live</dc:title>" +
             "<upnp:class>object.item.videoItem</upnp:class>" +
-            "<res protocolInfo=\"${xml(protocolInfo)}\">${xml(url)}</res>" +
+            "<res protocolInfo=\"${xml(protocolInfo)}\"$resolutionAttr>${xml(url)}</res>" +
             "</item></DIDL-Lite>"
     }
 

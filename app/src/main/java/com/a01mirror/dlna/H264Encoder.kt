@@ -26,9 +26,11 @@ class H264Encoder(
     private var sps: ByteArray? = null
     private var pps: ByteArray? = null
     private var projectionCallback: MediaProjection.Callback? = null
+    private var firstPtsUs = Long.MIN_VALUE
 
     fun start() {
         check(!running) { "encoder already running" }
+        firstPtsUs = Long.MIN_VALUE
         codec = createConfiguredCodec()
         inputSurface = codec!!.createInputSurface()
         codec!!.start()
@@ -59,14 +61,30 @@ class H264Encoder(
     private fun buildFormat(strict: Boolean): MediaFormat =
         MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            // Tar v6 memakai 2.5-3 Mbps untuk 720p; dongle Wi-Fi STB murahan tidak kuat bitrate besar.
-            setInteger(MediaFormat.KEY_BIT_RATE, if (width >= 1920) 6_000_000 else 3_000_000)
+            // Profil realtime untuk STB A01: cukup ringan tetapi tetap tajam untuk mirror 720p.
+            // Bitrate dijaga lebih rendah agar Wi-Fi dan decoder STB tidak membangun antrean latensi.
+            val bitrate = when {
+                width >= 1920 && fps >= 60 -> 5_000_000
+                width >= 1920 -> 4_000_000
+                fps >= 60 -> 3_000_000
+                fps >= 30 -> 2_400_000
+                else -> 2_000_000
+            }
+            setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            // Hindari B-frame/reordering karena itu menambah frame latency pada encoder.
             // Layar statis tidak menghasilkan frame baru; ulangi frame terakhir agar STB tidak kehabisan data.
             setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 250_000L)
             if (strict) {
                 // H.264 Main (ffmpeg -profile:v main di tar v6) + CBR untuk aliran live.
+                // Hint realtime hanya dipasang pada percobaan konfigurasi ketat; bila codec vendor
+                // tidak menerima salah satunya, percobaan fallback tetap memakai konfigurasi aman.
+                setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+                setInteger(MediaFormat.KEY_PRIORITY, 0)
+                setInteger(MediaFormat.KEY_LATENCY, 0)
+                setInteger(MediaFormat.KEY_OPERATING_RATE, fps)
+                setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, fps.toFloat())
                 setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileMain)
                 setInteger(MediaFormat.KEY_LEVEL, avcLevel())
                 setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
@@ -141,7 +159,10 @@ class H264Encoder(
                                 val annexB = normalizeH264(data)
                                 val isKey = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0 || containsIdr(annexB)
                                 val packet = if (isKey) prefixConfig(annexB) else annexB
-                                val pts = (info.presentationTimeUs.coerceAtLeast(0L) * 90L / 1000L)
+                                val rawPtsUs = info.presentationTimeUs.coerceAtLeast(0L)
+                                if (firstPtsUs == Long.MIN_VALUE) firstPtsUs = rawPtsUs
+                                val normalizedPtsUs = (rawPtsUs - firstPtsUs).coerceAtLeast(0L)
+                                val pts = normalizedPtsUs * 90L / 1000L
                                 broadcaster.publishVideo(packet, pts, isKey)
                             }
                         }

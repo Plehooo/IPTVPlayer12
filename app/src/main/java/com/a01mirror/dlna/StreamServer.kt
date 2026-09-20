@@ -8,6 +8,7 @@ import android.provider.MediaStore
 import java.io.BufferedReader
 import java.io.IOException
 import java.io.InputStreamReader
+import java.io.BufferedOutputStream
 import java.io.OutputStream
 import java.net.Inet4Address
 import java.net.NetworkInterface
@@ -24,7 +25,7 @@ import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.CopyOnWriteArrayList
 
 /** 188 * 32 byte, sama dengan ukuran baca ffmpeg->TS di tar v6. */
-private const val TS_CHUNK_BYTES = 188 * 32
+private const val TS_CHUNK_BYTES = 188 * 64
 
 class TsBroadcaster(
     private val resolver: ContentResolver
@@ -146,7 +147,9 @@ class TsBroadcaster(
         }
 
         output = if (pendingUri != android.net.Uri.EMPTY) {
-            try { resolver.openOutputStream(pendingUri, "w") } catch (_: Exception) { null }
+            try {
+                resolver.openOutputStream(pendingUri, "w")?.let { BufferedOutputStream(it, 64 * 1024) }
+            } catch (_: Exception) { null }
         } else null
     }
 
@@ -154,14 +157,21 @@ class TsBroadcaster(
         private val socket: Socket,
         private val output: OutputStream
     ) {
-        private val queue = ArrayBlockingQueue<ByteArray>(96)
+        // Antrean kecil menjaga stream tetap dekat realtime. Bila jaringan/STB tertinggal,
+        // buang paket paling lama daripada menumpuk beberapa detik latency.
+        private val queue = ArrayBlockingQueue<ByteArray>(12)
         @Volatile private var closed = false
         private var writer: Thread? = null
 
         fun offer(bytes: ByteArray): Boolean {
             if (closed) return false
-            // Clone because the caller may reuse its buffer after this method returns.
-            return queue.offer(bytes.copyOf())
+            if (queue.offer(bytes)) return true
+            // Prioritaskan data terbaru agar mirror tidak berubah menjadi delayed playback.
+            repeat(4) {
+                queue.poll() ?: return@repeat
+                if (queue.offer(bytes)) return true
+            }
+            return queue.offer(bytes)
         }
 
         fun start() {
@@ -297,7 +307,7 @@ class LiveHttpServer(
                     append("Content-Type: video/mpeg\r\n")
                     append("Cache-Control: no-cache, no-store, must-revalidate\r\n")
                     append("Pragma: no-cache\r\n")
-                    append("Connection: close\r\n")
+                    append("Connection: keep-alive\r\n")
                     append("Transfer-Encoding: chunked\r\n")
                     append("transferMode.dlna.org: Streaming\r\n")
                     append("contentFeatures.dlna.org: ").append(DlnaController.DLNA_FEATURES).append("\r\n")
