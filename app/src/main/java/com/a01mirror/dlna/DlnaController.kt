@@ -1026,7 +1026,7 @@ object DlnaController {
 
         val baseUri = URI(base)
         val normalized = when {
-            raw.startsWith("_urn:", ignoreCase = true) -> "/${raw.removePrefix("/")}
+            raw.startsWith("_urn:", ignoreCase = true) -> "/" + raw.removePrefix("/")
             else -> raw
         }
 
