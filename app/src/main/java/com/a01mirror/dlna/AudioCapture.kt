@@ -46,7 +46,7 @@ class AudioCapture(
 
                 ar = AudioRecord.Builder()
                     .setAudioFormat(format)
-                    .setBufferSizeInBytes(minBuffer * 2)
+                    .setBufferSizeInBytes((minBuffer * 3 / 2).coerceAtLeast(minBuffer))
                     .setAudioPlaybackCaptureConfig(config)
                     .build()
                 selectedRate = rate
@@ -68,9 +68,9 @@ class AudioCapture(
         lame = LameBuilder()
             .setInSampleRate(sampleRate)
             .setOutChannels(channels)
-            .setOutBitrate(128)
+            .setOutBitrate(96)
             .setOutSampleRate(sampleRate)
-            .setQuality(5)
+            .setQuality(7)
             .build()
 
         running = true
@@ -93,7 +93,7 @@ class AudioCapture(
         val rec = record ?: return
         val enc = lame ?: return
         // Dua frame MP3 per pembacaan (~48 ms pada 48 kHz), agar audio tidak menambah latency besar.
-        val framesPerRead = 1152 * 2
+        val framesPerRead = 1152
         val pcm = ShortArray(framesPerRead * channels)
         val mp3 = ByteArray(7200 + pcm.size * 2)
         var samplesPerChannel = 0L

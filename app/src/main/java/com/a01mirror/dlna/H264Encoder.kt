@@ -27,10 +27,12 @@ class H264Encoder(
     private var pps: ByteArray? = null
     private var projectionCallback: MediaProjection.Callback? = null
     private var firstPtsUs = Long.MIN_VALUE
+    private var firstWallNs = Long.MIN_VALUE
 
     fun start() {
         check(!running) { "encoder already running" }
         firstPtsUs = Long.MIN_VALUE
+        firstWallNs = Long.MIN_VALUE
         codec = createConfiguredCodec()
         inputSurface = codec!!.createInputSurface()
         codec!!.start()
@@ -160,8 +162,27 @@ class H264Encoder(
                                 val isKey = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0 || containsIdr(annexB)
                                 val packet = if (isKey) prefixConfig(annexB) else annexB
                                 val rawPtsUs = info.presentationTimeUs.coerceAtLeast(0L)
-                                if (firstPtsUs == Long.MIN_VALUE) firstPtsUs = rawPtsUs
+                                if (firstPtsUs == Long.MIN_VALUE) {
+                                    firstPtsUs = rawPtsUs
+                                    firstWallNs = System.nanoTime()
+                                }
                                 val normalizedPtsUs = (rawPtsUs - firstPtsUs).coerceAtLeast(0L)
+                                val nowNs = System.nanoTime()
+                                val elapsedUs = ((nowNs - firstWallNs).coerceAtLeast(0L)) / 1_000L
+
+                                // MediaCodec/surface kadang menghasilkan beberapa frame lebih cepat
+                                // daripada realtime. Jangan kirim burst ke STB: burst membuat buffer DMR
+                                // penuh dan akibatnya gambar tertinggal beberapa detik.
+                                val leadUs = normalizedPtsUs - elapsedUs
+                                if (leadUs > 0L) {
+                                    sleepMicros(leadUs)
+                                } else if (!isKey && elapsedUs - normalizedPtsUs > 120_000L) {
+                                    // Bila encoder/OS sudah tertinggal >120 ms, buang frame non-key
+                                    // agar stream kembali mengejar posisi live. Keyframe tetap dipertahankan.
+                                    c.releaseOutputBuffer(index, false)
+                                    continue
+                                }
+
                                 val pts = normalizedPtsUs * 90L / 1000L
                                 broadcaster.publishVideo(packet, pts, isKey)
                             }
@@ -174,6 +195,17 @@ class H264Encoder(
                 if (running) onFailure(t)
                 break
             }
+        }
+    }
+
+    private fun sleepMicros(micros: Long) {
+        if (micros <= 0L) return
+        try {
+            val millis = micros / 1_000L
+            val nanos = ((micros % 1_000L) * 1_000L).toInt()
+            if (millis > 0L || nanos > 0) Thread.sleep(millis, nanos)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
         }
     }
 

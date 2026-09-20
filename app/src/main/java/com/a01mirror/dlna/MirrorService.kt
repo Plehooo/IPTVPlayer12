@@ -36,6 +36,7 @@ class MirrorService : Service() {
     private var http: LiveHttpServer? = null
     private var renderer: DlnaController.Renderer? = null
     private var mirrorThread: Thread? = null
+    private var wifiLock: android.net.wifi.WifiManager.WifiLock? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -65,6 +66,7 @@ class MirrorService : Service() {
 
             val target = DlnaController.Renderer(name, hostFrom(location), location, control, serviceType)
             renderer = target
+            acquireWifiLowLatency()
 
             // Android 14+: permission/type requirements for a mediaProjection FGS are mandatory.
             startForeground(
@@ -109,13 +111,13 @@ class MirrorService : Service() {
                 try {
                     // Jangan menunggu berlebihan: server sudah mengirim PAT/PMT saat STB connect,
                     // lalu cukup pastikan frame video pertama sudah tersedia sebelum Play.
-                    val deadline = System.currentTimeMillis() + 1800L
+                    val deadline = System.currentTimeMillis() + 1200L
                     while (System.currentTimeMillis() < deadline && stream.videoFrames < 1L) {
                         Thread.sleep(30)
                     }
                     // Buffer awal pendek: cukup untuk melewatkan PAT/PMT + IDR pertama tanpa menambah
                     // detik latency seperti versi sebelumnya.
-                    Thread.sleep(140)
+                    Thread.sleep(20)
                     val r = renderer
                     if (r != null && streamUrl.startsWith("http://") && !streamUrl.startsWith("http://127.")) {
                         val result = DlnaController.playLive(r, streamUrl, "${width}x${height}")
@@ -159,11 +161,37 @@ class MirrorService : Service() {
         broadcaster = null
         try { projection?.stop() } catch (_: Exception) {}
         projection = null
+        releaseWifiLowLatency()
         stopForeground(STOP_FOREGROUND_REMOVE)
         super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    @Suppress("DEPRECATION")
+    private fun acquireWifiLowLatency() {
+        try {
+            val manager = getSystemService(android.net.wifi.WifiManager::class.java)
+            val lock = manager.createWifiLock(
+                android.net.wifi.WifiManager.WIFI_MODE_FULL_LOW_LATENCY,
+                "A01Mirror-LowLatency"
+            )
+            lock.setReferenceCounted(false)
+            lock.acquire()
+            wifiLock = lock
+        } catch (_: Exception) {
+            wifiLock = null
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun releaseWifiLowLatency() {
+        try {
+            wifiLock?.let { if (it.isHeld) it.release() }
+        } catch (_: Exception) {
+        }
+        wifiLock = null
+    }
 
     private fun buildNotification(text: String): Notification {
         val stopIntent = Intent(this, MirrorService::class.java).setAction(ACTION_STOP)

@@ -25,7 +25,7 @@ import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.CopyOnWriteArrayList
 
 /** 188 * 32 byte, sama dengan ukuran baca ffmpeg->TS di tar v6. */
-private const val TS_CHUNK_BYTES = 188 * 64
+private const val TS_CHUNK_BYTES = 188 * 32
 
 class TsBroadcaster(
     private val resolver: ContentResolver
@@ -36,6 +36,9 @@ class TsBroadcaster(
     private var pendingUri = android.net.Uri.EMPTY
     private var lastTablesNs = 0L
     private var recordingFailed = false
+    private val recordingQueue = ArrayBlockingQueue<ByteArray>(256)
+    @Volatile private var recordingRunning = false
+    private var recordingThread: Thread? = null
 
     /** Byte TS & frame video yang sudah dihasilkan; dipakai menunggu data pertama sebelum Play. */
     @Volatile var bytesPublished: Long = 0L
@@ -47,6 +50,7 @@ class TsBroadcaster(
 
     init {
         openRecording()
+        startRecordingWriter()
     }
 
     @Synchronized
@@ -71,17 +75,43 @@ class TsBroadcaster(
             broadcast(muxer.pmtPacket())
             lastTablesNs = System.nanoTime()
         }
+        // Jalur LIVE tidak boleh menunggu penulisan file. Rekaman ditangani thread terpisah
+        // agar I/O MediaStore tidak menahan encoder/stream ketika storage sedang lambat.
         writeRecording(packet)
         broadcast(packet)
     }
 
     private fun writeRecording(data: ByteArray) {
-        val out = output ?: return
-        if (recordingFailed) return
-        try {
-            out.write(data)
-        } catch (_: IOException) {
+        if (output == null || recordingFailed || !recordingRunning) return
+        // Jangan pernah membuat jalur live menunggu disk. 256 item memberi writer beberapa detik
+        // ruang bernapas pada storage yang sesekali lambat.
+        if (!recordingQueue.offer(data)) {
             recordingFailed = true
+        }
+    }
+
+    private fun startRecordingWriter() {
+        if (output == null || recordingRunning) return
+        recordingRunning = true
+        recordingThread = Thread {
+            try {
+                while (recordingRunning || recordingQueue.isNotEmpty()) {
+                    val data = recordingQueue.poll(250, java.util.concurrent.TimeUnit.MILLISECONDS) ?: continue
+                    val out = output ?: break
+                    if (!recordingFailed) {
+                        try {
+                            out.write(data)
+                        } catch (_: IOException) {
+                            recordingFailed = true
+                        }
+                    }
+                }
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+        }.also {
+            it.name = "A01-Recorder"
+            it.start()
         }
     }
 
@@ -96,6 +126,13 @@ class TsBroadcaster(
 
     @Synchronized
     fun attach(socket: Socket, outputStream: OutputStream) {
+        try {
+            socket.tcpNoDelay = true
+            socket.keepAlive = true
+            socket.sendBufferSize = 32 * 1024
+            socket.receiveBufferSize = 32 * 1024
+        } catch (_: Exception) {
+        }
         val client = Client(socket, outputStream)
         if (!client.offer(muxer.patPacket()) || !client.offer(muxer.pmtPacket())) {
             client.close()
@@ -109,6 +146,12 @@ class TsBroadcaster(
     fun close() {
         for (client in clients) client.close()
         clients.clear()
+
+        recordingRunning = false
+        try { recordingThread?.interrupt() } catch (_: Exception) {}
+        try { recordingThread?.join(900) } catch (_: InterruptedException) {}
+        recordingThread = null
+        recordingQueue.clear()
 
         try { output?.flush() } catch (_: Exception) {}
         try { output?.close() } catch (_: Exception) {}
@@ -159,7 +202,7 @@ class TsBroadcaster(
     ) {
         // Antrean kecil menjaga stream tetap dekat realtime. Bila jaringan/STB tertinggal,
         // buang paket paling lama daripada menumpuk beberapa detik latency.
-        private val queue = ArrayBlockingQueue<ByteArray>(12)
+        private val queue = ArrayBlockingQueue<ByteArray>(4)
         @Volatile private var closed = false
         private var writer: Thread? = null
 
