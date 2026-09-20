@@ -17,17 +17,16 @@ class AudioCapture(
     private var lame: AndroidLame? = null
     private var thread: Thread? = null
     @Volatile private var running = false
-    private var sampleRate = 48000
+    private var sampleRate = 44100
     private var channels = 2
 
     fun start() {
         if (running) return
         if (android.os.Build.VERSION.SDK_INT < 29) return
 
-        // 48 kHz dulu (standar TV/DVB, sama dengan -ar 48000 di tar v6), 44.1 kHz cadangan.
-        val rates = intArrayOf(48000, 44100)
+        val rates = intArrayOf(44100, 48000)
         var ar: AudioRecord? = null
-        var selectedRate = 48000
+        var selectedRate = 44100
         for (rate in rates) {
             try {
                 val minBuffer = AudioRecord.getMinBufferSize(
@@ -69,7 +68,7 @@ class AudioCapture(
             .setInSampleRate(sampleRate)
             .setOutChannels(channels)
             .setOutBitrate(128)
-            .setOutSampleRate(sampleRate)
+            .setOutSampleRate(44100)
             .setQuality(5)
             .build()
 

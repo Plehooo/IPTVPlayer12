@@ -63,8 +63,7 @@ class MirrorService : Service() {
             val serviceType = intent.getStringExtra(EXTRA_RENDERER_SERVICE_TYPE)
                 ?: "urn:schemas-upnp-org:service:AVTransport:1"
 
-            val target = DlnaController.Renderer(name, hostFrom(location), location, control, serviceType)
-            renderer = target
+            renderer = DlnaController.Renderer(name, hostFrom(location), location, control, serviceType)
 
             // Android 14+: permission/type requirements for a mediaProjection FGS are mandatory.
             startForeground(
@@ -81,8 +80,7 @@ class MirrorService : Service() {
             broadcaster = stream
             http = LiveHttpServer(stream, stream.sessionToken).also { it.start() }
 
-            // IP HP dihitung ke arah STB (bukan asal ambil wlan0) supaya URL stream terbaca STB.
-            val ip = localIpv4For(this, target.host)
+            val ip = localIpv4(this)
             val streamUrl = "http://$ip:${http!!.port}/a01/${stream.sessionToken}/stream.ts"
             updateNotification("Live ${width}×${height}@${fps}fps • $ip:${http!!.port}")
 
@@ -106,25 +104,16 @@ class MirrorService : Service() {
             ).also { it.start() }
 
             mirrorThread = Thread {
-                try {
-                    // Sama seperti /api/media/play di tar v6: jangan suruh STB Play sebelum
-                    // ada data TS (frame video pertama) supaya tidak layar hitam / loading lama.
-                    val deadline = System.currentTimeMillis() + 8000L
-                    while (System.currentTimeMillis() < deadline && stream.videoFrames < 1L) {
-                        Thread.sleep(100)
+                // Give encoder/server a moment to produce the first PAT/PMT/IDR before telling the STB to play.
+                Thread.sleep(1200)
+                val r = renderer
+                if (r != null && streamUrl.startsWith("http://")) {
+                    val result = DlnaController.playLive(r, streamUrl)
+                    if (result.isSuccess) {
+                        updateNotification("Tayang ke ${r.name} • Rekam berjalan")
+                    } else {
+                        postError(result.exceptionOrNull()?.message ?: "DLNA gagal")
                     }
-                    Thread.sleep(300)
-                    val r = renderer
-                    if (r != null) {
-                        val result = DlnaController.playLive(r, streamUrl)
-                        if (result.isSuccess) {
-                            updateNotification("Tayang ke ${r.name} • Rekam berjalan")
-                        } else {
-                            postError(result.exceptionOrNull()?.message ?: "DLNA gagal")
-                        }
-                    }
-                } catch (_: InterruptedException) {
-                    // Service dihentikan saat menunggu.
                 }
             }.also { it.name = "A01-DLNA"; it.start() }
 

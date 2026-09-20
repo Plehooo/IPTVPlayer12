@@ -29,7 +29,15 @@ class H264Encoder(
 
     fun start() {
         check(!running) { "encoder already running" }
-        codec = createConfiguredCodec()
+        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+            setInteger(MediaFormat.KEY_BIT_RATE, if (width >= 1920) 8_000_000 else 4_500_000)
+            setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+        }
+
+        codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        codec!!.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         inputSurface = codec!!.createInputSurface()
         codec!!.start()
 
@@ -54,48 +62,6 @@ class H264Encoder(
 
         running = true
         thread = Thread { drainLoop() }.also { it.name = "A01-H264"; it.start() }
-    }
-
-    private fun buildFormat(strict: Boolean): MediaFormat =
-        MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
-            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            // Tar v6 memakai 2.5-3 Mbps untuk 720p; dongle Wi-Fi STB murahan tidak kuat bitrate besar.
-            setInteger(MediaFormat.KEY_BIT_RATE, if (width >= 1920) 6_000_000 else 3_000_000)
-            setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-            // Layar statis tidak menghasilkan frame baru; ulangi frame terakhir agar STB tidak kehabisan data.
-            setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 250_000L)
-            if (strict) {
-                // H.264 Main (ffmpeg -profile:v main di tar v6) + CBR untuk aliran live.
-                setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileMain)
-                setInteger(MediaFormat.KEY_LEVEL, avcLevel())
-                setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
-            }
-        }
-
-    /** Level terendah yang cukup untuk resolusi/fps (720p30 = 3.1 seperti tar v6). */
-    private fun avcLevel(): Int {
-        val mbs = ((width + 15) / 16) * ((height + 15) / 16)
-        val rate = mbs * fps
-        return when {
-            mbs <= 3600 && rate <= 108_000 -> MediaCodecInfo.CodecProfileLevel.AVCLevel31
-            mbs <= 5120 && rate <= 216_000 -> MediaCodecInfo.CodecProfileLevel.AVCLevel32
-            mbs <= 8192 && rate <= 245_760 -> MediaCodecInfo.CodecProfileLevel.AVCLevel4
-            else -> MediaCodecInfo.CodecProfileLevel.AVCLevel42
-        }
-    }
-
-    /** Coba profil Main + CBR dulu; kalau encoder HP menolak, pakai konfigurasi bawaan. */
-    private fun createConfiguredCodec(): MediaCodec {
-        var c = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-        try {
-            c.configure(buildFormat(true), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        } catch (_: Exception) {
-            try { c.release() } catch (_: Exception) {}
-            c = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-            c.configure(buildFormat(false), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        }
-        return c
     }
 
     fun stop() {

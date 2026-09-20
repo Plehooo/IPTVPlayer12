@@ -1,61 +1,36 @@
 package com.a01mirror.dlna
 
+import android.content.Context
+import android.net.ConnectivityManager
 import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.LinkAddress
 import java.net.DatagramPacket
 import java.net.DatagramSocket
-import java.net.HttpURLConnection
 import java.net.Inet4Address
 import java.net.InetAddress
-import java.net.InetSocketAddress
-import java.net.MulticastSocket
-import java.net.NetworkInterface
-import java.net.Socket
-import java.net.SocketAddress
-import java.net.SocketTimeoutException
+import java.net.HttpURLConnection
 import java.net.URI
 import java.net.URL
 import java.nio.charset.StandardCharsets
-import java.util.Collections
-import java.util.concurrent.Callable
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
+import java.util.LinkedHashSet
 import java.util.regex.Pattern
 
 /**
- * SSDP + UPnP AVTransport client untuk renderer DLNA murahan (STB T2 Advance A01 / STP-A01).
+ * SSDP + UPnP AVTransport control point tuned for the inexpensive DLNA DMR
+ * implementations commonly found in set-top boxes such as the Advance A01.
  *
- * Format kawat (DIDL, header, urutan SOAP) disamakan dengan advance01-media-center-v6 (Termux)
- * yang sudah terbukti jalan di STB. Pencarian SSDP dikirim per-interface (Wi-Fi, hotspot, LAN)
- * supaya tetap ketemu walau data seluler jadi jaringan default. Bisa juga lewat IP manual.
+ * The class keeps the original public surface but makes discovery/control much
+ * more tolerant of Android phones that have mobile data, VPNs or multiple
+ * network interfaces active at the same time.
  */
 object DlnaController {
-    /** Sama persis dengan DLNA_FEATURES di server.py (tar v6). */
-    const val DLNA_FEATURES =
-        "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
-
-    private const val SSDP_ADDRESS = "239.255.255.250"
+    private const val SSDP_HOST = "239.255.255.250"
     private const val SSDP_PORT = 1900
-
-    private val SEARCH_TARGETS = listOf(
-        "urn:schemas-upnp-org:device:MediaRenderer:1",
-        "urn:schemas-upnp-org:service:AVTransport:1",
-        "upnp:rootdevice",
-        "ssdp:all"
-    )
-
-    private val SKIP_INTERFACE_PREFIXES = listOf("rmnet", "ccmni", "tun", "dummy", "v4-", "clat", "ppp", "ipsec")
-
-    // Port/path umum untuk deskripsi UPnP di STB murahan (dipakai bila SSDP tidak dibalas).
-    private val PROBE_PORTS = intArrayOf(
-        49152, 49153, 49154, 49155, 52235, 52323, 8200, 8080, 5000, 7676, 8000, 9000, 2869, 60006, 8060, 80
-    )
-    private val PROBE_PATHS = listOf(
-        "/description.xml", "/dmr.xml", "/rootDesc.xml", "/DeviceDescription.xml", "/desc.xml",
-        "/upnp/desc.xml", "/dev/desc.xml", "/MediaRenderer/desc.xml", "/device.xml", "/ssdp/device-desc.xml"
-    )
-
-    private val IPV4 = Pattern.compile("^\\d{1,3}(\\.\\d{1,3}){3}$")
+    private const val USER_AGENT = "A01Mirror/1.1 UPnP/1.1"
+    private const val SEARCH_MX = 2
+    private const val DISCOVERY_WAIT_MS = 2500L
+    private const val UNICAST_SWEEP_LIMIT = 512L
 
     data class Renderer(
         val name: String,
@@ -67,484 +42,338 @@ object DlnaController {
         val sinkProtocolInfo: String? = null
     )
 
-    private class LocalIf(
-        val name: String,
-        val ni: NetworkInterface?,
-        val address: Inet4Address,
-        val prefix: Int,
-        val network: Network?
-    )
-
-    /** Ringkasan proses pencarian terakhir (untuk ditampilkan saat STB tidak ketemu). */
-    @Volatile
-    var lastReport: String = ""
-        private set
-
-    /**
-     * Cari renderer DLNA. [manualIp] opsional: IP STB yang tampil di layar STB.
-     * Bila diisi, dicoba dulu SSDP unicast + tebak alamat deskripsi; multicast tetap jadi cadangan.
-     */
-    fun discover(manualIp: String? = null): List<Renderer> {
-        val log: MutableList<String> = Collections.synchronizedList(ArrayList<String>())
-        val replies = ConcurrentHashMap<String, String>() // location -> IP pengirim balasan
+    /** Discover DLNA renderers on the current Wi-Fi/LAN. */
+    fun discover(): List<Renderer> {
         val context = DiscoveryContextHolder.context
+        val wifi = context?.let { findWifiNetwork(it) }
         val lock = context?.let { getMulticastLock(it) }
-        try {
-            val ip = manualIp?.trim().orEmpty()
-            if (ip.isNotEmpty()) {
-                if (IPV4.matcher(ip).matches()) scanByIp(ip, replies, log)
-                else log.add("IP manual tidak valid: $ip")
-            }
-            if (replies.isEmpty()) scanMulticast(replies, log)
+        val locations = LinkedHashSet<String>()
 
-            val found = resolveRenderers(replies, log)
-            log.add(
-                if (found.isEmpty()) "Tidak ada perangkat DMR/AVTransport yang ditemukan."
-                else "DMR: " + found.joinToString { "${it.name} (${it.host})" }
-            )
-            lastReport = log.joinToString("\n")
-            return found
-        } catch (t: Throwable) {
-            log.add("Pencarian gagal: ${t.message}")
-            lastReport = log.joinToString("\n")
-            return emptyList()
+        try {
+            DatagramSocket().use { socket ->
+                socket.reuseAddress = true
+                socket.soTimeout = 300
+
+                // Important on Android with both Wi-Fi and mobile/VPN interfaces:
+                // force the SSDP socket onto the Wi-Fi network that contains the STB.
+                if (wifi?.network != null) {
+                    try {
+                        wifi.network.bindSocket(socket)
+                    } catch (_: Throwable) {
+                        // Fall back to the OS-selected route if binding is unavailable.
+                    }
+                }
+
+                val targets = listOf(
+                    "urn:schemas-upnp-org:device:MediaRenderer:1",
+                    "urn:schemas-upnp-org:device:MediaRenderer:2",
+                    "upnp:rootdevice",
+                    "ssdp:all"
+                )
+
+                // UPnP recommends sending M-SEARCH more than once because UDP is
+                // unreliable. Send two quick copies, then listen for the whole MX window.
+                repeat(2) {
+                    for (st in targets) {
+                        try {
+                            sendSearch(socket, st, InetAddress.getByName(SSDP_HOST), SSDP_PORT)
+                        } catch (_: Exception) {
+                        }
+                    }
+                    if (it == 0) Thread.sleep(40)
+                }
+
+                collectResponses(socket, DISCOVERY_WAIT_MS, locations)
+            }
+        } catch (_: Exception) {
+            // A multicast failure must not prevent the unicast fallback below.
         } finally {
             try { lock?.release() } catch (_: Exception) {}
         }
+
+        // Some home/ISP Wi-Fi firmware filters SSDP multicast. Because the phone
+        // and STB are explicitly expected to be on the same LAN, probe the local
+        // IPv4 subnet as a second path. This is only enabled for reasonably sized
+        // home LANs so the app never performs a huge address sweep.
+        if (locations.isEmpty() && wifi != null) {
+            locations.addAll(unicastDiscovery(wifi))
+        }
+
+        return locations.asSequence()
+            .mapNotNull { location ->
+                try { parseRenderer(location) } catch (_: Exception) { null }
+            }
+            .filter { it.avTransportControlUrl.isNotBlank() }
+            .distinctBy {
+                "${it.host.lowercase()}|${it.avTransportControlUrl.lowercase()}"
+            }
+            .toList()
     }
 
     /** Supply an application context before calling discover(). */
-    fun setDiscoveryContext(context: android.content.Context) {
+    fun setDiscoveryContext(context: Context) {
         DiscoveryContextHolder.context = context.applicationContext
     }
 
+    /**
+     * Set a live URI on the DMR and start playback.
+     *
+     * A01-class renderers are often happier when the transport is explicitly
+     * stopped before changing URI, and a few firmwares accept the URI with
+     * metadata while others only accept the URI without metadata. We try both
+     * without changing the external API used by the rest of the app.
+     */
     fun playLive(renderer: Renderer, streamUrl: String): Result<Unit> {
         if (renderer.avTransportControlUrl.isBlank()) {
             return Result.failure(IllegalStateException("AVTransport tidak tersedia"))
         }
+        if (!streamUrl.startsWith("http://") && !streamUrl.startsWith("https://")) {
+            return Result.failure(IllegalArgumentException("URL stream tidak valid"))
+        }
 
-        val attempts = listOf(
+        val serviceTypes = linkedSetOf<String>().apply {
+            add(renderer.avTransportServiceType.ifBlank {
+                "urn:schemas-upnp-org:service:AVTransport:1"
+            })
+            add("urn:schemas-upnp-org:service:AVTransport:1")
+        }
+
+        val metadataAttempts = listOf(
             didlMetadata(streamUrl),
-            "",
+            ""
         )
         var lastError: Throwable? = null
 
-        for (metadata in attempts) {
-            try {
-                soap(
-                    renderer.avTransportControlUrl,
-                    renderer.avTransportServiceType,
-                    "SetAVTransportURI",
-                    "<InstanceID>0</InstanceID>" +
-                        "<CurrentURI>${xml(streamUrl)}</CurrentURI>" +
-                        "<CurrentURIMetaData>${xml(metadata)}</CurrentURIMetaData>"
-                )
-                // Sama dengan set_and_play() di tar v6: jeda sebelum Play.
-                Thread.sleep(500)
-                soap(
-                    renderer.avTransportControlUrl,
-                    renderer.avTransportServiceType,
-                    "Play",
-                    "<InstanceID>0</InstanceID><Speed>1</Speed>"
-                )
-                Thread.sleep(700)
-                try {
-                    soap(
-                        renderer.avTransportControlUrl,
-                        renderer.avTransportServiceType,
-                        "GetTransportInfo",
-                        "<InstanceID>0</InstanceID>"
-                    )
-                } catch (_: Exception) {
+        for (serviceType in serviceTypes) {
+            for (metadata in metadataAttempts) {
+                repeat(2) {
+                    try {
+                        // Defensive Stop: some DMRs return 705/transport-locked if
+                        // SetAVTransportURI arrives while a previous item is active.
+                        bestEffortStop(renderer.avTransportControlUrl, serviceType)
+                        Thread.sleep(180)
+
+                        soap(
+                            renderer.avTransportControlUrl,
+                            serviceType,
+                            "SetAVTransportURI",
+                            "<InstanceID>0</InstanceID>" +
+                                "<CurrentURI>${xml(streamUrl)}</CurrentURI>" +
+                                "<CurrentURIMetaData>${xml(metadata)}</CurrentURIMetaData>"
+                        )
+
+                        // Give the A01 HTTP server a short head start after the URI
+                        // is accepted, then issue the standard Play action.
+                        Thread.sleep(450)
+                        soap(
+                            renderer.avTransportControlUrl,
+                            serviceType,
+                            "Play",
+                            "<InstanceID>0</InstanceID><Speed>1</Speed>"
+                        )
+                        Thread.sleep(250)
+
+                        return Result.success(Unit)
+                    } catch (t: Throwable) {
+                        lastError = t
+                        try { Thread.sleep(250) } catch (_: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                            return Result.failure(IllegalStateException("DLNA dibatalkan"))
+                        }
+                    }
                 }
-                return Result.success(Unit)
-            } catch (t: Throwable) {
-                lastError = t
             }
         }
 
         return Result.failure(
-            IllegalStateException("DLNA gagal: ${lastError?.message ?: "renderer menolak stream"}")
+            IllegalStateException(
+                "DLNA gagal ke ${renderer.name} (${renderer.host}): " +
+                    (lastError?.message ?: "renderer menolak stream")
+            )
         )
     }
 
     fun stop(renderer: Renderer) {
-        try {
-            soap(
-                renderer.avTransportControlUrl,
-                renderer.avTransportServiceType,
-                "Stop",
-                "<InstanceID>0</InstanceID>"
-            )
-        } catch (_: Exception) {
+        val serviceTypes = linkedSetOf<String>().apply {
+            add(renderer.avTransportServiceType)
+            add("urn:schemas-upnp-org:service:AVTransport:1")
+        }
+        for (serviceType in serviceTypes) {
+            try {
+                soap(
+                    renderer.avTransportControlUrl,
+                    serviceType,
+                    "Stop",
+                    "<InstanceID>0</InstanceID>"
+                )
+                break
+            } catch (_: Exception) {
+                // A Stop on an idle renderer can legitimately return a SOAP fault.
+            }
         }
     }
 
-    /**
-     * IP HP yang dilihat STB: soket UDP "connect" ke STB lalu baca alamat lokalnya
-     * (sama dengan local_ip_for_renderer() di tar v6). Cocok untuk Wi-Fi maupun hotspot HP.
-     */
-    fun localAddressToward(host: String): String? {
+    private data class WifiNetworkInfo(
+        val network: Network,
+        val address: Inet4Address,
+        val prefixLength: Int
+    )
+
+    private fun findWifiNetwork(context: Context): WifiNetworkInfo? {
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            ?: return null
+
+        val candidates = ArrayList<Network>()
+        cm.activeNetwork?.let { candidates.add(it) }
         try {
-            DatagramSocket(null as SocketAddress?).use { s ->
-                val net = networkFor(host)
-                if (net != null) {
-                    try { net.bindSocket(s) } catch (_: Exception) {}
-                }
-                s.connect(InetAddress.getByName(host), SSDP_PORT)
-                val a = s.localAddress
-                val text = a?.hostAddress
-                if (a != null && !a.isAnyLocalAddress && !a.isLoopbackAddress && !text.isNullOrBlank()) return text
-            }
-        } catch (_: Exception) {
+            cm.allNetworks.forEach { network -> if (!candidates.contains(network)) candidates.add(network) }
+        } catch (_: Throwable) {
         }
-        // Cadangan: interface lokal yang satu subnet dengan STB.
-        try {
-            val target = InetAddress.getByName(host)
-            for (li in localInterfaces()) {
-                if (sameSubnet(li.address, target, li.prefix)) return li.address.hostAddress
+
+        for (network in candidates) {
+            try {
+                val caps = cm.getNetworkCapabilities(network) ?: continue
+                val wifiOrEthernet =
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                        caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+                if (!wifiOrEthernet) continue
+
+                val lp = cm.getLinkProperties(network) ?: continue
+                val match = lp.linkAddresses.firstOrNull { link ->
+                    val a = link.address
+                    a is Inet4Address && !a.isLoopbackAddress && !a.isLinkLocalAddress
+                } ?: continue
+
+                return WifiNetworkInfo(
+                    network = network,
+                    address = match.address as Inet4Address,
+                    prefixLength = match.prefixLength
+                )
+            } catch (_: Throwable) {
             }
-        } catch (_: Exception) {
         }
         return null
     }
 
-    // ---------------------------------------------------------------------------------------
-    // Pencarian
-    // ---------------------------------------------------------------------------------------
+    private fun sendSearch(
+        socket: DatagramSocket,
+        searchTarget: String,
+        address: InetAddress,
+        port: Int
+    ) {
+        val request = buildString {
+            append("M-SEARCH * HTTP/1.1\r\n")
+            append("HOST: ").append(address.hostAddress).append(":").append(port).append("\r\n")
+            append("MAN: \"ssdp:discover\"\r\n")
+            append("MX: ").append(SEARCH_MX).append("\r\n")
+            append("ST: ").append(searchTarget).append("\r\n")
+            append("USER-AGENT: ").append(USER_AGENT).append("\r\n")
+            append("\r\n")
+        }.toByteArray(StandardCharsets.US_ASCII)
 
-    private fun scanMulticast(replies: MutableMap<String, String>, log: MutableList<String>) {
-        val interfaces = localInterfaces()
-        if (interfaces.isEmpty()) {
-            log.add("Interface Wi-Fi/hotspot/LAN aktif tidak terdeteksi (pakai jalur default).")
-        } else {
-            log.add("Interface dipindai: " + interfaces.joinToString { "${it.name} ${it.address.hostAddress}" })
-        }
-
-        val threads = ArrayList<Thread>()
-        for (li in interfaces) {
-            threads.add(Thread { searchOn(li, replies, log) }.also { it.name = "A01-SSDP-${li.name}"; it.start() })
-        }
-        // Jalur default tetap dicoba sebagai cadangan.
-        threads.add(Thread { searchOn(null, replies, log) }.also { it.name = "A01-SSDP-default"; it.start() })
-        for (t in threads) {
-            try { t.join(8000) } catch (_: InterruptedException) {}
-        }
-        log.add("Balasan SSDP: ${replies.size} perangkat")
-        for ((loc, from) in replies) log.add("  $from -> $loc")
+        socket.send(DatagramPacket(request, request.size, address, port))
     }
 
-    private fun searchOn(li: LocalIf?, replies: MutableMap<String, String>, log: MutableList<String>) {
-        val label = li?.name ?: "default"
-        var socket: MulticastSocket? = null
-        try {
-            val s = MulticastSocket(null as SocketAddress?)
-            socket = s
-            s.reuseAddress = true
-            val net = li?.network
-            if (net != null) {
-                try { net.bindSocket(s) } catch (_: Exception) {}
-            }
-            s.bind(InetSocketAddress(li?.address, 0))
-            val ni = li?.ni
-            if (ni != null) {
-                try { s.setNetworkInterface(ni) } catch (_: Exception) {}
-            }
-            try { s.setTimeToLive(2) } catch (_: Exception) {}
-            s.soTimeout = 300
-
-            val group = InetAddress.getByName(SSDP_ADDRESS)
-            for (round in 0 until 2) {
-                for (st in SEARCH_TARGETS) {
-                    val data = msearch(st)
-                    try { s.send(DatagramPacket(data, data.size, group, SSDP_PORT)) } catch (_: Exception) {}
-                }
-                collect(s, if (round == 0) 1500L else 2500L, replies)
-            }
-        } catch (t: Exception) {
-            log.add("SSDP $label gagal: ${t.message}")
-        } finally {
-            try { socket?.close() } catch (_: Exception) {}
-        }
-    }
-
-    private fun scanByIp(ip: String, replies: MutableMap<String, String>, log: MutableList<String>) {
-        log.add("IP manual: $ip")
-        var socket: DatagramSocket? = null
-        try {
-            val s = DatagramSocket(null as SocketAddress?)
-            socket = s
-            val net = networkFor(ip)
-            if (net != null) {
-                try { net.bindSocket(s) } catch (_: Exception) {}
-            }
-            s.bind(InetSocketAddress(0))
-            s.soTimeout = 300
-            val target = InetAddress.getByName(ip)
-            for (round in 0 until 2) {
-                for (st in SEARCH_TARGETS) {
-                    val data = msearch(st)
-                    try { s.send(DatagramPacket(data, data.size, target, SSDP_PORT)) } catch (_: Exception) {}
-                }
-                collect(s, 1500L, replies)
-            }
-        } catch (t: Exception) {
-            log.add("SSDP unicast ke $ip gagal: ${t.message}")
-        } finally {
-            try { socket?.close() } catch (_: Exception) {}
-        }
-
-        if (replies.isEmpty()) {
-            log.add("STB $ip tidak membalas SSDP unicast, mencoba tebak alamat deskripsi…")
-            probeDescription(ip, replies, log)
-        }
-    }
-
-    private fun probeDescription(ip: String, replies: MutableMap<String, String>, log: MutableList<String>) {
-        val pool = Executors.newFixedThreadPool(8)
-        try {
-            val open: MutableList<Int> = Collections.synchronizedList(ArrayList<Int>())
-            val portTasks = PROBE_PORTS.map { port ->
-                Callable<Unit> {
-                    if (tcpOpen(ip, port, 600)) open.add(port)
-                    Unit
-                }
-            }
-            pool.invokeAll(portTasks, 6, TimeUnit.SECONDS)
-            val openSnapshot = synchronized(open) { open.sorted() }
-            log.add("Port terbuka di $ip: " + (if (openSnapshot.isEmpty()) "-" else openSnapshot.joinToString()))
-
-            val pathTasks = openSnapshot.flatMap { port ->
-                PROBE_PATHS.map { path ->
-                    Callable<Unit> {
-                        val url = "http://$ip:$port$path"
-                        try {
-                            val body = httpGet(url, 1500)
-                            if (body.contains("urn:schemas-upnp-org:device", ignoreCase = true)) {
-                                replies.putIfAbsent(url, ip)
-                            }
-                        } catch (_: Exception) {
-                        }
-                        Unit
-                    }
-                }
-            }
-            if (pathTasks.isNotEmpty()) pool.invokeAll(pathTasks, 12, TimeUnit.SECONDS)
-        } finally {
-            pool.shutdownNow()
-        }
-    }
-
-    private fun collect(socket: DatagramSocket, durationMs: Long, replies: MutableMap<String, String>) {
-        val deadline = System.currentTimeMillis() + durationMs
+    private fun collectResponses(
+        socket: DatagramSocket,
+        windowMs: Long,
+        locations: MutableSet<String>
+    ) {
+        val deadline = System.currentTimeMillis() + windowMs
         val buffer = ByteArray(16 * 1024)
         while (System.currentTimeMillis() < deadline) {
             try {
                 val packet = DatagramPacket(buffer, buffer.size)
                 socket.receive(packet)
-                val text = String(packet.data, 0, packet.length, StandardCharsets.UTF_8)
-                val location = parseHeaders(text)["location"]?.trim().orEmpty()
-                val from = packet.address?.hostAddress
-                if (location.isNotEmpty() && !from.isNullOrBlank()) {
-                    replies.putIfAbsent(fixHost(location, from), from)
-                }
-            } catch (_: SocketTimeoutException) {
-                // Lanjut sampai jendela pencarian habis.
+                val text = String(packet.data, 0, packet.length, StandardCharsets.US_ASCII)
+                val headers = parseHeaders(text)
+                headers["location"]?.takeIf { it.isNotBlank() }?.let(locations::add)
+            } catch (_: java.net.SocketTimeoutException) {
+                // Keep listening until the complete MX window has elapsed.
             } catch (_: Exception) {
-                // Abaikan balasan rusak dan terus memindai.
+                // Ignore malformed/unsupported SSDP responses.
             }
         }
     }
 
-    private fun resolveRenderers(replies: Map<String, String>, log: MutableList<String>): List<Renderer> {
-        if (replies.isEmpty()) return emptyList()
-        val pool = Executors.newFixedThreadPool(6)
-        val parsed = ArrayList<Renderer>()
+    private fun unicastDiscovery(wifi: WifiNetworkInfo): List<String> {
+        val hostValues = ipv4HostRange(wifi.address, wifi.prefixLength)
+        if (hostValues.isEmpty()) return emptyList()
+
+        val locations = LinkedHashSet<String>()
+        val lock = DiscoveryContextHolder.context?.let { getMulticastLock(it) }
         try {
-            val tasks = replies.entries.map { entry ->
-                val location = entry.key
-                val from = entry.value
-                Callable<Renderer?> {
+            DatagramSocket().use { socket ->
+                socket.reuseAddress = true
+                socket.soTimeout = 250
+                try { wifi.network.bindSocket(socket) } catch (_: Throwable) {}
+
+                for (value in hostValues) {
                     try {
-                        parseRenderer(location, from)
-                    } catch (t: Exception) {
-                        log.add("Gagal baca $location: ${t.message}")
-                        null
-                    }
-                }
-            }
-            for (future in pool.invokeAll(tasks, 12, TimeUnit.SECONDS)) {
-                try {
-                    if (!future.isCancelled) future.get()?.let { parsed.add(it) }
-                } catch (_: Exception) {
-                }
-            }
-        } finally {
-            pool.shutdownNow()
-        }
-
-        for (r in parsed) {
-            if (r.avTransportControlUrl.isBlank()) log.add("Bukan DMR (tanpa AVTransport): ${r.name} (${r.host})")
-        }
-        return parsed
-            .filter { it.avTransportControlUrl.isNotBlank() }
-            .distinctBy { it.avTransportControlUrl.lowercase() }
-    }
-
-    private fun msearch(st: String): ByteArray = buildString {
-        append("M-SEARCH * HTTP/1.1\r\n")
-        append("HOST: 239.255.255.250:1900\r\n")
-        append("MAN: \"ssdp:discover\"\r\n")
-        append("MX: 2\r\n")
-        append("ST: ").append(st).append("\r\n")
-        append("USER-AGENT: Android/UPnP/1.1 A01Mirror/1.0\r\n")
-        append("\r\n")
-    }.toByteArray(StandardCharsets.US_ASCII)
-
-    // ---------------------------------------------------------------------------------------
-    // Interface / jaringan
-    // ---------------------------------------------------------------------------------------
-
-    private fun connectivity(): android.net.ConnectivityManager? =
-        DiscoveryContextHolder.context
-            ?.getSystemService(android.content.Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
-
-    @Suppress("DEPRECATION")
-    private fun allNetworks(): List<Network> = try {
-        connectivity()?.allNetworks?.toList() ?: emptyList()
-    } catch (_: Exception) {
-        emptyList()
-    }
-
-    @Suppress("DEPRECATION")
-    private fun localInterfaces(): List<LocalIf> {
-        val found = LinkedHashMap<String, LocalIf>()
-        val cm = connectivity()
-        val networks = allNetworks()
-
-        try {
-            val all = NetworkInterface.getNetworkInterfaces()
-            if (all != null) {
-                for (ni in Collections.list(all)) {
-                    try {
-                        if (!ni.isUp || ni.isLoopback) continue
-                        val lower = ni.name.lowercase()
-                        if (SKIP_INTERFACE_PREFIXES.any { lower.startsWith(it) }) continue
-                        val net = networks.firstOrNull { cm?.getLinkProperties(it)?.interfaceName == ni.name }
-                        for (ia in ni.interfaceAddresses) {
-                            val a = ia.address
-                            if (a is Inet4Address && !a.isLoopbackAddress && !a.isLinkLocalAddress) {
-                                val key = a.hostAddress ?: continue
-                                found.putIfAbsent(key, LocalIf(ni.name, ni, a, ia.networkPrefixLength.toInt(), net))
-                            }
-                        }
+                        val address = InetAddress.getByName(intToIpv4(value))
+                        sendSearch(
+                            socket,
+                            "ssdp:all",
+                            address,
+                            SSDP_PORT
+                        )
                     } catch (_: Exception) {
                     }
                 }
-            }
-        } catch (_: Exception) {
-        }
 
-        // Cadangan bila enumerasi NetworkInterface dibatasi sistem: ambil dari ConnectivityManager.
-        if (cm != null) {
-            for (n in networks) {
-                try {
-                    val caps = cm.getNetworkCapabilities(n) ?: continue
-                    val isLan = caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) ||
-                        caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_ETHERNET)
-                    if (!isLan) continue
-                    val lp = cm.getLinkProperties(n) ?: continue
-                    val ni = try { lp.interfaceName?.let { NetworkInterface.getByName(it) } } catch (_: Exception) { null }
-                    for (la in lp.linkAddresses) {
-                        val a = la.address
-                        if (a is Inet4Address && !a.isLoopbackAddress && !a.isLinkLocalAddress) {
-                            val key = a.hostAddress ?: continue
-                            found.putIfAbsent(key, LocalIf(lp.interfaceName ?: "wifi", ni, a, la.prefixLength, n))
-                        }
-                    }
-                } catch (_: Exception) {
-                }
+                collectResponses(socket, DISCOVERY_WAIT_MS, locations)
             }
+        } finally {
+            try { lock?.release() } catch (_: Exception) {}
         }
-        return found.values.toList()
+        return locations.toList()
     }
 
-    /** Network (Wi-Fi/LAN) yang punya rute lokal ke [host]; null bila tidak ada (mis. hotspot HP). */
-    @Suppress("DEPRECATION")
-    private fun networkFor(host: String): Network? {
-        return try {
-            val cm = connectivity() ?: return null
-            val address = InetAddress.getByName(host)
-            cm.allNetworks.firstOrNull { n ->
-                val lp = cm.getLinkProperties(n)
-                lp != null && lp.routes.any { !it.isDefaultRoute && it.matches(address) }
-            }
-        } catch (_: Exception) {
-            null
+    private fun ipv4HostRange(address: Inet4Address, prefixLength: Int): List<Long> {
+        if (prefixLength < 20 || prefixLength > 30) return emptyList()
+        val ip = ipv4ToInt(address)
+        val mask = if (prefixLength == 0) 0L
+        else (0xFFFFFFFFL shl (32 - prefixLength)) and 0xFFFFFFFFL
+        val network = ip and mask
+        val broadcast = network or (mask.inv() and 0xFFFFFFFFL)
+        val first = network + 1L
+        val last = broadcast - 1L
+        if (last < first) return emptyList()
+        if (last - first + 1L > UNICAST_SWEEP_LIMIT) return emptyList()
+        val out = ArrayList<Long>((last - first + 1L).toInt())
+        var current = first
+        while (current <= last) {
+            out.add(current)
+            current++
         }
+        return out
     }
 
-    private fun sameSubnet(local: Inet4Address, remote: InetAddress, prefix: Int): Boolean {
-        if (remote !is Inet4Address || prefix !in 1..32) return false
-        val a = local.address
-        val b = remote.address
-        var bits = prefix
-        var i = 0
-        while (bits > 0 && i < 4) {
-            val mask = if (bits >= 8) 0xFF else (0xFF shl (8 - bits)) and 0xFF
-            if ((a[i].toInt() and mask) != (b[i].toInt() and mask)) return false
-            bits -= 8
-            i++
-        }
-        return true
+    private fun ipv4ToInt(address: Inet4Address): Long {
+        val b = address.address
+        return ((b[0].toLong() and 0xFF) shl 24) or
+            ((b[1].toLong() and 0xFF) shl 16) or
+            ((b[2].toLong() and 0xFF) shl 8) or
+            (b[3].toLong() and 0xFF)
     }
 
-    private fun tcpOpen(ip: String, port: Int, timeoutMs: Int): Boolean {
-        return try {
-            Socket().use { s ->
-                val net = networkFor(ip)
-                if (net != null) {
-                    try { net.bindSocket(s) } catch (_: Exception) {}
-                }
-                s.connect(InetSocketAddress(ip, port), timeoutMs)
-                true
-            }
-        } catch (_: Exception) {
-            false
-        }
-    }
+    private fun intToIpv4(value: Long): String =
+        listOf(
+            (value ushr 24) and 0xFF,
+            (value ushr 16) and 0xFF,
+            (value ushr 8) and 0xFF,
+            value and 0xFF
+        ).joinToString(".")
 
-    // ---------------------------------------------------------------------------------------
-    // UPnP
-    // ---------------------------------------------------------------------------------------
-
-    /** Perbaiki host LOCATION yang kosong/0.0.0.0/127.x dengan IP pengirim balasan SSDP. */
-    private fun fixHost(url: String, fromIp: String): String {
-        return try {
-            val uri = URI(url)
-            val h = uri.host
-            if (h.isNullOrBlank() || h == "0.0.0.0" || h == "localhost" || h.startsWith("127.")) {
-                URI(uri.scheme ?: "http", uri.userInfo, fromIp, uri.port, uri.path, uri.query, uri.fragment).toString()
-            } else {
-                url
-            }
-        } catch (_: Exception) {
-            Regex("^(https?://)[^/:]*").replace(url) { m -> m.groupValues[1] + fromIp }
-        }
-    }
-
-    private fun parseRenderer(location: String, fromIp: String): Renderer {
+    private fun parseRenderer(location: String): Renderer {
         val xmlText = httpGet(location)
         val friendly = tag(xmlText, "friendlyName").ifBlank { "DLNA Renderer" }
-        val urlBase = tag(xmlText, "URLBase")
-        val base = if (urlBase.isNotBlank() && fixHost(urlBase, fromIp) == urlBase) urlBase else location
         val serviceBlockPattern = Pattern.compile(
-            "<service\\b[^>]*>(.*?)</service>",
+            "<(?:[A-Za-z0-9_.-]+:)?service\\b[^>]*>(.*?)</(?:[A-Za-z0-9_.-]+:)?service>",
             Pattern.CASE_INSENSITIVE or Pattern.DOTALL
         )
         val matcher = serviceBlockPattern.matcher(xmlText)
-        var avControl = ""
-        var avType = "urn:schemas-upnp-org:service:AVTransport:1"
+        val avCandidates = mutableListOf<Pair<String, String>>()
         var cmControl: String? = null
 
         while (matcher.find()) {
@@ -553,14 +382,24 @@ object DlnaController {
             val control = tag(service, "controlURL")
             when {
                 type.contains("AVTransport", ignoreCase = true) && control.isNotBlank() -> {
-                    avControl = fixHost(resolveUrl(base, control), fromIp)
-                    avType = type
+                    avCandidates += type to resolveUrl(location, control)
                 }
                 type.contains("ConnectionManager", ignoreCase = true) && control.isNotBlank() -> {
-                    cmControl = fixHost(resolveUrl(base, control), fromIp)
+                    if (cmControl == null) cmControl = resolveUrl(location, control)
                 }
             }
         }
+
+        // Prefer AVTransport:1, then the lowest advertised version. This avoids
+        // accidentally selecting a secondary vendor service that does not control
+        // the actual media renderer transport.
+        val selectedAv = avCandidates
+            .sortedWith(compareBy<Pair<String, String>>(
+                { versionOf(it.first).let { v -> if (v == 1) 0 else 1 } },
+                { versionOf(it.first) },
+                { it.first }
+            ))
+            .firstOrNull()
 
         var sink: String? = null
         if (cmControl != null) {
@@ -578,54 +417,94 @@ object DlnaController {
 
         return Renderer(
             name = friendly,
-            host = fromIp,
+            host = URI(location).host ?: location,
             location = location,
-            avTransportControlUrl = avControl,
-            avTransportServiceType = avType,
+            avTransportControlUrl = selectedAv?.second ?: "",
+            avTransportServiceType = selectedAv?.first
+                ?: "urn:schemas-upnp-org:service:AVTransport:1",
             connectionManagerControlUrl = cmControl,
             sinkProtocolInfo = sink
         )
     }
 
-    private fun openConnection(url: String): HttpURLConnection {
-        val u = URL(url)
-        val net = networkFor(u.host)
-        return (net?.openConnection(u) ?: u.openConnection()) as HttpURLConnection
+    private fun versionOf(serviceType: String): Int {
+        return serviceType.substringAfterLast(':', "1").toIntOrNull() ?: 1
+    }
+
+    private fun bestEffortStop(controlUrl: String, serviceType: String) {
+        try {
+            soap(
+                controlUrl,
+                serviceType,
+                "Stop",
+                "<InstanceID>0</InstanceID>"
+            )
+        } catch (_: Exception) {
+        }
     }
 
     private fun soap(controlUrl: String, serviceType: String, action: String, args: String): String {
-        val body = "<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
-            "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" " +
-            "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">" +
-            "<s:Body><u:$action xmlns:u=\"$serviceType\">$args</u:$action></s:Body></s:Envelope>"
+        val body = """
+            <?xml version="1.0" encoding="utf-8"?>
+            <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+              <s:Body>
+                <u:$action xmlns:u="$serviceType">$args</u:$action>
+              </s:Body>
+            </s:Envelope>
+        """.trimIndent()
 
-        val connection = openConnection(controlUrl)
-        connection.connectTimeout = 3000
+        val connection = openHttp(controlUrl)
+        connection.connectTimeout = 3500
         connection.readTimeout = 8000
         connection.requestMethod = "POST"
+        connection.doInput = true
         connection.doOutput = true
         connection.useCaches = false
         connection.setRequestProperty("Content-Type", "text/xml; charset=\"utf-8\"")
         connection.setRequestProperty("SOAPACTION", "\"$serviceType#$action\"")
         connection.setRequestProperty("Connection", "close")
-        connection.setRequestProperty("User-Agent", "Advance01-MediaCenter/6.0 A01Mirror")
-        connection.outputStream.use { it.write(body.toByteArray(StandardCharsets.UTF_8)) }
+        connection.setRequestProperty("Accept", "text/xml, */*")
+        connection.setRequestProperty("User-Agent", USER_AGENT)
 
-        val code = connection.responseCode
-        val input = if (code in 200..299) connection.inputStream else connection.errorStream
-        val response = input?.bufferedReader(StandardCharsets.UTF_8)?.use { it.readText() } ?: ""
-        connection.disconnect()
-        if (code !in 200..299) throw IllegalStateException("HTTP $code ${response.take(300)}")
-        return response
+        try {
+            connection.outputStream.use { it.write(body.toByteArray(StandardCharsets.UTF_8)) }
+
+            val code = connection.responseCode
+            val input = if (code in 200..299) connection.inputStream else connection.errorStream
+            val response = input?.bufferedReader(StandardCharsets.UTF_8)?.use { it.readText() } ?: ""
+            if (code !in 200..299) {
+                throw IllegalStateException(
+                    "HTTP $code ${response.replace(Regex("\\s+"), " ").take(500)}"
+                )
+            }
+            return response
+        } finally {
+            connection.disconnect()
+        }
     }
 
-    private fun httpGet(url: String, timeoutMs: Int = 3000): String {
-        val connection = openConnection(url)
-        connection.connectTimeout = timeoutMs
-        connection.readTimeout = timeoutMs + 2000
+    private fun openHttp(url: String): HttpURLConnection {
+        val context = DiscoveryContextHolder.context
+        if (context != null) {
+            val wifi = findWifiNetwork(context)
+            if (wifi != null) {
+                try {
+                    return wifi.network.openConnection(URL(url)) as HttpURLConnection
+                } catch (_: Throwable) {
+                }
+            }
+        }
+        return URL(url).openConnection() as HttpURLConnection
+    }
+
+    private fun httpGet(url: String): String {
+        val connection = openHttp(url)
+        connection.connectTimeout = 3500
+        connection.readTimeout = 6000
         connection.requestMethod = "GET"
         connection.useCaches = false
-        connection.setRequestProperty("User-Agent", "Advance01-MediaCenter/6.0 A01Mirror")
+        connection.setRequestProperty("Connection", "close")
+        connection.setRequestProperty("User-Agent", USER_AGENT)
         return try {
             connection.inputStream.bufferedReader(StandardCharsets.UTF_8).use { it.readText() }
         } finally {
@@ -633,22 +512,27 @@ object DlnaController {
         }
     }
 
-    /** Metadata satu baris, persis seperti metadata_for() di tar v6 (tanpa DLNA.ORG_PN). */
     private fun didlMetadata(url: String): String {
-        val protocolInfo = "http-get:*:video/mpeg:$DLNA_FEATURES"
-        return "<DIDL-Lite xmlns:dc=\"http://purl.org/dc/elements/1.1/\" " +
-            "xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\" " +
-            "xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\">" +
-            "<item id=\"1\" parentID=\"0\" restricted=\"1\">" +
-            "<dc:title>A01 Mirror Live</dc:title>" +
-            "<upnp:class>object.item.videoItem</upnp:class>" +
-            "<res protocolInfo=\"${xml(protocolInfo)}\">${xml(url)}</res>" +
-            "</item></DIDL-Lite>"
+        // The APK stream is H.264 + MPEG-1 Layer III inside a 188-byte MPEG-2 TS.
+        // AVC_TS_MP_HD_MPEG1_L3 is the matching DLNA profile for that combination.
+        val protocolInfo =
+            "http-get:*:video/mpeg:DLNA.ORG_PN=AVC_TS_MP_HD_MPEG1_L3;DLNA.ORG_OP=00;DLNA.ORG_CI=0"
+        return """
+            <DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"
+                xmlns:dc="http://purl.org/dc/elements/1.1/"
+                xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">
+              <item id="1" parentID="-1" restricted="1">
+                <dc:title>A01 Mirror Live</dc:title>
+                <upnp:class>object.item.videoItem</upnp:class>
+                <res protocolInfo="$protocolInfo">${xml(url)}</res>
+              </item>
+            </DIDL-Lite>
+        """.trimIndent()
     }
 
     private fun tag(text: String, name: String): String {
         val pattern = Pattern.compile(
-            "<$name[^>]*>(.*?)</$name>",
+            "<(?:[A-Za-z0-9_.-]+:)?$name\\b[^>]*>(.*?)</(?:[A-Za-z0-9_.-]+:)?$name>",
             Pattern.CASE_INSENSITIVE or Pattern.DOTALL
         )
         return pattern.matcher(text).let {
@@ -657,8 +541,7 @@ object DlnaController {
     }
 
     private fun parseHeaders(text: String): Map<String, String> =
-        text.split("\n").drop(1).mapNotNull { raw ->
-            val line = raw.trim()
+        text.split("\r\n").drop(1).mapNotNull { line ->
             val index = line.indexOf(':')
             if (index <= 0) null
             else line.substring(0, index).trim().lowercase() to line.substring(index + 1).trim()
@@ -680,9 +563,9 @@ object DlnaController {
         .replace("\"", "&quot;")
         .replace("'", "&apos;")
 
-    private fun getMulticastLock(context: android.content.Context): android.net.wifi.WifiManager.MulticastLock? {
+    private fun getMulticastLock(context: Context): android.net.wifi.WifiManager.MulticastLock? {
         return try {
-            val wifi = context.applicationContext.getSystemService(android.content.Context.WIFI_SERVICE)
+            val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE)
                     as? android.net.wifi.WifiManager
             wifi?.createMulticastLock("A01Mirror-SSDP")?.apply {
                 setReferenceCounted(false)
@@ -694,6 +577,6 @@ object DlnaController {
     }
 
     private object DiscoveryContextHolder {
-        @Volatile var context: android.content.Context? = null
+        @Volatile var context: Context? = null
     }
 }

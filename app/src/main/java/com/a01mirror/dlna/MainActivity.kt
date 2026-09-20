@@ -3,18 +3,14 @@ package com.a01mirror.dlna
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
-import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
 import android.os.Bundle
-import android.text.InputType
 import android.view.Gravity
 import android.widget.ArrayAdapter
 import android.widget.Button
-import android.widget.EditText
 import android.widget.LinearLayout
-import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
@@ -28,7 +24,6 @@ class MainActivity : Activity() {
 
     private lateinit var status: TextView
     private lateinit var deviceText: TextView
-    private lateinit var ipInput: EditText
     private lateinit var resolutionSpinner: Spinner
     private lateinit var fpsSpinner: Spinner
 
@@ -65,14 +60,6 @@ class MainActivity : Activity() {
         }
         root.addView(subtitle)
 
-        ipInput = EditText(this).apply {
-            hint = "IP STB (opsional), mis. 192.168.1.50"
-            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
-            setSingleLine(true)
-            setText(getSharedPreferences("a01mirror", Context.MODE_PRIVATE).getString("stb_ip", "") ?: "")
-        }
-        root.addView(ipInput, LinearLayout.LayoutParams(-1, -2))
-
         val scan = Button(this).apply {
             text = "Cari STB DLNA"
             setOnClickListener { scanDlna() }
@@ -104,7 +91,7 @@ class MainActivity : Activity() {
         fpsSpinner.adapter = ArrayAdapter(
             this,
             android.R.layout.simple_spinner_dropdown_item,
-            listOf("25 fps (sesuai STB T2, disarankan)", "30 fps", "60 fps (uji perangkat)")
+            listOf("30 fps (stabil)", "60 fps (uji perangkat)")
         )
         root.addView(fpsSpinner, LinearLayout.LayoutParams(-1, -2))
 
@@ -138,22 +125,18 @@ class MainActivity : Activity() {
         }
         root.addView(note)
 
-        // Layar bisa penuh (kolom IP + laporan pencarian), jadi dibuat bisa di-scroll.
-        setContentView(ScrollView(this).apply { addView(root) })
+        setContentView(root)
     }
 
     private fun scanDlna() {
-        val manualIp = ipInput.text.toString().trim()
-        getSharedPreferences("a01mirror", Context.MODE_PRIVATE).edit().putString("stb_ip", manualIp).apply()
-        status.text = if (manualIp.isEmpty()) "Mencari perangkat DLNA…" else "Mencari STB di $manualIp…"
+        status.text = "Mencari perangkat DLNA…"
         executor.execute {
-            val found = DlnaController.discover(manualIp)
+            val found = DlnaController.discover()
             runOnUiThread {
                 renderers.clear()
                 renderers.addAll(found)
                 if (found.isEmpty()) {
-                    status.text = "STB tidak ditemukan. Pastikan HP dan STB satu Wi-Fi/hotspot, DLNA/DMR aktif di STB, " +
-                        "lalu isi IP STB (lihat di layar STB) dan cari lagi.\n\n" + DlnaController.lastReport
+                    status.text = "STB tidak ditemukan. Pastikan Wi-Fi dongle aktif + DLNA di STP-A01."
                 } else {
                     status.text = "Ditemukan ${found.size} perangkat DLNA."
                     chooseRenderer()
@@ -167,7 +150,7 @@ class MainActivity : Activity() {
             Toast.makeText(this, "Tekan Cari STB DLNA dulu.", Toast.LENGTH_SHORT).show()
             return
         }
-        val names = renderers.map { "${it.name}\n${it.host}\n${it.location}" }.toTypedArray()
+        val names = renderers.map { "${it.name}\n${it.location}" }.toTypedArray()
         AlertDialog.Builder(this)
             .setTitle("Pilih perangkat DLNA")
             .setItems(names) { _, which ->
@@ -196,11 +179,7 @@ class MainActivity : Activity() {
     private fun startMirrorService(resultCode: Int, data: Intent, renderer: DlnaController.Renderer) {
         val width = if (resolutionSpinner.selectedItemPosition == 0) 1280 else 1920
         val height = if (resolutionSpinner.selectedItemPosition == 0) 720 else 1080
-        val fps = when (fpsSpinner.selectedItemPosition) {
-            0 -> 25
-            1 -> 30
-            else -> 60
-        }
+        val fps = if (fpsSpinner.selectedItemPosition == 0) 30 else 60
 
         val intent = Intent(this, MirrorService::class.java).apply {
             putExtra(MirrorService.EXTRA_RESULT_CODE, resultCode)
