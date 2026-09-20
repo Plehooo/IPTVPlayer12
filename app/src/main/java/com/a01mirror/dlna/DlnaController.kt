@@ -1009,7 +1009,39 @@ object DlnaController {
             else line.substring(0, index).trim().lowercase() to line.substring(index + 1).trim()
         }.toMap()
 
-    private fun resolveUrl(base: String, path: String): String = URI(base).resolve(path).toString()
+    /**
+     * Resolve URL/path dari description UPnP. Firmware A01/Xiaomi lama kadang mengirim
+     * controlURL sebagai path vendor `_urn:...` (contoh:
+     * `_urn:schemas-upnp-org:service:AVTransport_control`). Java URI menganggap bagian
+     * sebelum `:` sebagai scheme sehingga `URI.resolve()` melempar
+     * "Illegal character in scheme name" karena scheme `_urn` tidak valid.
+     *
+     * Path vendor tersebut tetap merupakan endpoint HTTP pada host/port yang sama, jadi
+     * paksa menjadi absolute-path `/` sebelum di-resolve. Fallback serupa menjaga kompatibilitas
+     * bila firmware lain memakai path relatif non-standar yang mengandung `:`.
+     */
+    private fun resolveUrl(base: String, path: String): String {
+        val raw = path.trim()
+        if (raw.isBlank()) return base
+
+        val baseUri = URI(base)
+        val normalized = when {
+            raw.startsWith("_urn:", ignoreCase = true) -> "/${raw.removePrefix("/")}
+            else -> raw
+        }
+
+        return try {
+            baseUri.resolve(normalized).toString()
+        } catch (e: IllegalArgumentException) {
+            // Be tolerant of vendor control/event URLs such as `urn:...` or other colon-based
+            // relative paths. An actual absolute http(s) URL is handled normally by URI.resolve().
+            if (!normalized.startsWith("/") && !normalized.contains("://") && normalized.contains(':')) {
+                baseUri.resolve("/${normalized.removePrefix("/")}").toString()
+            } else {
+                throw e
+            }
+        }
+    }
 
     private fun htmlUnescape(value: String): String = value
         .replace("&amp;", "&")
