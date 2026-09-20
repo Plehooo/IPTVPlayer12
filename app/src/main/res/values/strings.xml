@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">A01 Mirror</string>
+    <string name="channel_desc">Screen mirror + recorder for DLNA STB</string>
+</resources>
