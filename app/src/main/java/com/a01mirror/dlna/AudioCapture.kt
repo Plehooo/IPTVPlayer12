@@ -5,8 +5,8 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.media.projection.MediaProjection
-import com.github.naman14.androidlame.AndroidLame
-import com.github.naman14.androidlame.LameBuilder
+import com.naman14.androidlame.AndroidLame
+import com.naman14.androidlame.LameBuilder
 
 class AudioCapture(
     private val projection: MediaProjection,
@@ -102,7 +102,7 @@ class AudioCapture(
                 val shorts = rec.read(pcm, 0, pcm.size, AudioRecord.READ_BLOCKING)
                 if (shorts <= 0) continue
                 val perChannel = shorts / channels
-                val encoded = enc.encodeBufferInterleaved(pcm, perChannel, mp3)
+                val encoded = enc.encodeBufferInterLeaved(pcm, perChannel, mp3)
                 if (encoded > 0) {
                     val bytes = mp3.copyOf(encoded)
                     val pts = samplesPerChannel * 90000L / sampleRate

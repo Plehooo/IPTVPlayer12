@@ -168,7 +168,7 @@ class MpegTsMuxer {
         packet[off + 1] = (base shr 17).toByte()
         packet[off + 2] = (base shr 9).toByte()
         packet[off + 3] = (base shr 1).toByte()
-        packet[off + 4] = (((base and 0x01) shl 7) or 0x7E or (ext shr 8)).toByte()
+        packet[off + 4] = (((base and 0x01) shl 7) or 0x7E or (ext shr 8).toLong()).toByte()
         packet[off + 5] = ext.toByte()
     }
 
