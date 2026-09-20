@@ -997,7 +997,7 @@ object DlnaController {
             Pattern.CASE_INSENSITIVE or Pattern.DOTALL
         )
         return pattern.matcher(text).let {
-            if (it.find()) htmlUnescape(it.group(1).trim()) else ""
+            if (it.find()) htmlUnescape(it.group(1)?.trim().orEmpty()) else ""
         }
     }
 
