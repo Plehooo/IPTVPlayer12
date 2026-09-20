@@ -72,3 +72,13 @@ TAndroidLame is a GPL-3.0 project and uses native code. Verify its license oblig
 - Format DLNA (DIDL tanpa `DLNA.ORG_PN`, `OP=01` + `FLAGS`, HTTP/1.1 chunked, header `contentFeatures.dlna.org` / `transferMode.dlna.org`, jeda antara `SetAVTransportURI` dan `Play`, Play baru dikirim setelah ada frame video pertama) disamakan dengan `advance01-media-center-v6`. Default video 720p / 25 fps, H.264 Main, audio MPEG-1 Layer III 48 kHz.
 - Tombol **Log DLNA** menampilkan laporan pencarian dan 30 SOAP terakhir (mirip `soap_trace` di tar v6) untuk dikirim saat ada error. Saat STB dipilih, aplikasi langsung menguji `GetTransportInfo` dan `GetProtocolInfo` dan menampilkan hasilnya.
 - Chunk HTTP dipotong per 188×32 byte (kelipatan paket TS), PAT/PMT dikirim tiap 0,25 detik, seperti ffmpeg di tar v6.
+
+
+## MAX3 low-latency notes
+- Keeps the existing project structure and DLNA flow.
+- Uses a hardware AVC encoder with Surface input when available.
+- Avoids per-TS-packet allocations in the MPEG-TS hot path.
+- PAT/PMT control packets never flush the live queue as keyframes.
+- Live client queues keep fresh data and can recover from codec resets without recreating MediaProjection.
+- Recording I/O is isolated from the live path and bounded under memory pressure.
+- HTTP semantics intentionally match the working Advance A01 v6 server more closely.

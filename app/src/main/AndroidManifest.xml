@@ -31,7 +31,9 @@
 
         <service
             android:name=".MirrorService"
+            android:process=":mirror"
             android:exported="false"
-            android:foregroundServiceType="mediaProjection" />
+            android:foregroundServiceType="mediaProjection"
+            android:stopWithTask="false" />
     </application>
 </manifest>

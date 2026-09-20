@@ -4,10 +4,11 @@ import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
+import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.media.projection.MediaProjection
+import android.os.Build
 import android.os.Bundle
-import android.os.Process
 import java.nio.ByteBuffer
 
 class H264Encoder(
@@ -34,11 +35,18 @@ class H264Encoder(
     private var lateStreak = 0
     private var healthySinceNs = Long.MIN_VALUE
     private var lastBitrateChangeNs = 0L
+    private var lastSyncRequestNs = 0L
+    private var lastClientDrops = 0L
+    private var recoveries = 0
+    private var videoPtsOffset90k = 0L
+    private var lastVideoPts90k = -1L
 
+    @Synchronized
     fun start() {
         check(!running) { "encoder already running" }
-        firstPtsUs = Long.MIN_VALUE
-        firstWallNs = Long.MIN_VALUE
+        resetClock()
+        videoPtsOffset90k = 0L
+        lastVideoPts90k = -1L
         codec = createConfiguredCodec()
         inputSurface = codec!!.createInputSurface()
         codec!!.start()
@@ -64,10 +72,6 @@ class H264Encoder(
 
         running = true
         thread = Thread {
-            try {
-                Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY)
-            } catch (_: Throwable) {
-            }
             drainLoop()
         }.also {
             it.name = "A01-H264"
@@ -75,11 +79,12 @@ class H264Encoder(
         }
     }
 
-    private fun buildFormat(strict: Boolean): MediaFormat =
+    private fun buildFormat(
+        strict: Boolean,
+        encoderCapabilities: MediaCodecInfo.EncoderCapabilities? = null
+    ): MediaFormat =
         MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            // Profil realtime untuk STB A01: cukup ringan tetapi tetap tajam untuk mirror 720p.
-            // Bitrate dijaga lebih rendah agar Wi-Fi dan decoder STB tidak membangun antrean latensi.
             val bitrate = when {
                 width >= 1920 && fps >= 60 -> 5_000_000
                 width >= 1920 -> 4_000_000
@@ -89,16 +94,12 @@ class H264Encoder(
             }
             baseBitrate = bitrate
             currentBitrate = bitrate
+            broadcaster.setTargetVideoBitrate(bitrate)
             setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-            // Hindari B-frame/reordering karena itu menambah frame latency pada encoder.
-            // Layar statis tidak menghasilkan frame baru; ulangi frame terakhir agar STB tidak kehabisan data.
             setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 250_000L)
             if (strict) {
-                // H.264 Main (ffmpeg -profile:v main di tar v6) + CBR untuk aliran live.
-                // Hint realtime hanya dipasang pada percobaan konfigurasi ketat; bila codec vendor
-                // tidak menerima salah satunya, percobaan fallback tetap memakai konfigurasi aman.
                 setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
                 setInteger(MediaFormat.KEY_PRIORITY, 0)
                 setInteger(MediaFormat.KEY_LATENCY, 0)
@@ -106,11 +107,17 @@ class H264Encoder(
                 setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, fps.toFloat())
                 setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileMain)
                 setInteger(MediaFormat.KEY_LEVEL, avcLevel())
-                setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
+                val frameDropCbr = if (Build.VERSION.SDK_INT >= 31 &&
+                    encoderCapabilities?.isBitrateModeSupported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR_FD) == true
+                ) {
+                    MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR_FD
+                } else {
+                    MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
+                }
+                setInteger(MediaFormat.KEY_BITRATE_MODE, frameDropCbr)
             }
         }
 
-    /** Level terendah yang cukup untuk resolusi/fps (720p30 = 3.1 seperti tar v6). */
     private fun avcLevel(): Int {
         val mbs = ((width + 15) / 16) * ((height + 15) / 16)
         val rate = mbs * fps
@@ -122,12 +129,68 @@ class H264Encoder(
         }
     }
 
-    /** Coba profil Main + CBR dulu; kalau encoder HP menolak, pakai konfigurasi bawaan. */
+    /** Prefer a real hardware AVC encoder with Surface input; fall back safely if vendor hints are rejected. */
     private fun createConfiguredCodec(): MediaCodec {
+        if (Build.VERSION.SDK_INT >= 29) {
+            try {
+                val codecList = MediaCodecList(MediaCodecList.REGULAR_CODECS)
+                val candidates = codecList.codecInfos
+                    .asSequence()
+                    .filter { it.isEncoder }
+                    .filter { it.supportedTypes.any { t -> t.equals(MediaFormat.MIMETYPE_VIDEO_AVC, true) } }
+                    .filter { runCatching { it.isHardwareAccelerated }.getOrDefault(false) }
+                    .sortedWith(compareBy<MediaCodecInfo> {
+                        runCatching { !it.isVendor }.getOrDefault(true)
+                    }.thenBy { it.name.contains("google", ignoreCase = true) })
+                    .toList()
+
+                for (info in candidates) {
+                    try {
+                        val caps = info.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
+                        if (!caps.colorFormats.contains(MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)) continue
+                        val candidate = MediaCodec.createByCodecName(info.name)
+                        try {
+                            candidate.configure(
+                                buildFormat(true, caps.encoderCapabilities),
+                                null,
+                                null,
+                                MediaCodec.CONFIGURE_FLAG_ENCODE
+                            )
+                            return candidate
+                        } catch (_: Throwable) {
+                            try { candidate.release() } catch (_: Exception) {}
+                        }
+
+                        // Some vendor codecs reject one optional strict hint (for example
+                        // CBR-FD/profile/latency) while still supporting hardware Surface input.
+                        // Retry the same hardware codec with the conservative format before ever
+                        // falling back to a generic encoder that might be software-only.
+                        try {
+                            val relaxed = MediaCodec.createByCodecName(info.name)
+                            try {
+                                relaxed.configure(
+                                    buildFormat(false, caps.encoderCapabilities),
+                                    null,
+                                    null,
+                                    MediaCodec.CONFIGURE_FLAG_ENCODE
+                                )
+                                return relaxed
+                            } catch (_: Throwable) {
+                                try { relaxed.release() } catch (_: Exception) {}
+                            }
+                        } catch (_: Throwable) {
+                        }
+                    } catch (_: Throwable) {
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+        }
+
         var c = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
         try {
             c.configure(buildFormat(true), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             try { c.release() } catch (_: Exception) {}
             c = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
             c.configure(buildFormat(false), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
@@ -135,6 +198,7 @@ class H264Encoder(
         return c
     }
 
+    @Synchronized
     fun stop() {
         running = false
         thread?.interrupt()
@@ -151,6 +215,13 @@ class H264Encoder(
         codec = null
     }
 
+    private fun resetClock() {
+        firstPtsUs = Long.MIN_VALUE
+        firstWallNs = Long.MIN_VALUE
+        lateStreak = 0
+        healthySinceNs = Long.MIN_VALUE
+    }
+
     private fun drainLoop() {
         val info = MediaCodec.BufferInfo()
         while (running) {
@@ -165,79 +236,87 @@ class H264Encoder(
                     }
                     else -> if (index >= 0) {
                         val buffer = c.getOutputBuffer(index)
-                        if (buffer != null && info.size > 0) {
-                            val data = ByteArray(info.size)
-                            val oldPos = buffer.position()
-                            buffer.position(info.offset)
-                            buffer.get(data)
-                            buffer.position(oldPos)
+                        try {
+                            if (buffer != null && info.size > 0) {
+                                val data = ByteArray(info.size)
+                                val oldPos = buffer.position()
+                                buffer.position(info.offset)
+                                buffer.get(data)
+                                buffer.position(oldPos)
 
-                            if ((info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
-                                setConfig(ByteBuffer.wrap(data))
-                            } else if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) == 0) {
-                                val annexB = normalizeH264(data)
-                                val isKey = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0 || containsIdr(annexB)
-                                val packet = if (isKey) prefixConfig(annexB) else annexB
-                                val rawPtsUs = info.presentationTimeUs.coerceAtLeast(0L)
-                                if (firstPtsUs == Long.MIN_VALUE) {
-                                    firstPtsUs = rawPtsUs
-                                    firstWallNs = System.nanoTime()
-                                }
-                                val normalizedPtsUs = (rawPtsUs - firstPtsUs).coerceAtLeast(0L)
-                                val nowNs = System.nanoTime()
-                                val elapsedUs = ((nowNs - firstWallNs).coerceAtLeast(0L)) / 1_000L
+                                if ((info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
+                                    setConfig(ByteBuffer.wrap(data))
+                                } else if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) == 0) {
+                                    val annexB = normalizeH264(data)
+                                    val isKey =
+                                        (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0 || containsIdrFast(annexB)
+                                    val rawPtsUs = info.presentationTimeUs.coerceAtLeast(0L)
 
-                                // Pacing mikro: jangan pernah membiarkan encoder memburst ke network,
-                                // tetapi juga jangan tidur lama karena itu sendiri bisa menambah latency.
-                                // Cukup tahan lead maksimal ~25 ms pada tiap output; sisanya dikejar
-                                // dengan frame dropping jika pipeline sudah tertinggal.
-                                val leadUs = normalizedPtsUs - elapsedUs
-                                if (leadUs > 0L) {
-                                    sleepMicros(minOf(leadUs, 25_000L))
-                                }
-
-                                val lagUs = elapsedUs - normalizedPtsUs
-                                if (lagUs > 90_000L) {
-                                    lateStreak++
-                                    healthySinceNs = Long.MIN_VALUE
-                                } else {
-                                    lateStreak = 0
-                                    if (healthySinceNs == Long.MIN_VALUE) healthySinceNs = nowNs
-                                }
-
-                                // Jika HP mulai kehabisan headroom, turunkan bitrate secara dinamis.
-                                // Ini bukan mode kualitas permanen: hanya emergency governor agar queue
-                                // tidak berubah menjadi backlog. Setelah pipeline stabil, bitrate dipulihkan.
-                                maybeAdaptBitrate(c, lagUs, nowNs)
-
-                                if (!isKey && lagUs > 100_000L) {
-                                    try {
-                                        c.setParameters(Bundle().apply {
-                                            putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
-                                        })
-                                    } catch (_: Throwable) {
+                                    if (firstPtsUs == Long.MIN_VALUE) {
+                                        firstPtsUs = rawPtsUs
+                                        firstWallNs = System.nanoTime()
                                     }
-                                    c.releaseOutputBuffer(index, false)
-                                    continue
-                                }
 
-                                val pts = normalizedPtsUs * 90L / 1000L
-                                broadcaster.publishVideo(packet, pts, isKey)
+                                    val normalizedPtsUs = (rawPtsUs - firstPtsUs).coerceAtLeast(0L)
+                                    val nowNs = System.nanoTime()
+                                    val elapsedUs = ((nowNs - firstWallNs).coerceAtLeast(0L)) / 1_000L
+                                    val lagUs = elapsedUs - normalizedPtsUs
+
+                                    if (lagUs > 90_000L) {
+                                        lateStreak++
+                                        healthySinceNs = Long.MIN_VALUE
+                                    } else {
+                                        lateStreak = 0
+                                        if (healthySinceNs == Long.MIN_VALUE) healthySinceNs = nowNs
+                                    }
+
+                                    val clientDrops = broadcaster.droppedClientPackets
+                                    val networkPressure = clientDrops != lastClientDrops
+                                    lastClientDrops = clientDrops
+                                    maybeAdaptBitrate(c, lagUs, nowNs, networkPressure)
+
+                                    if (!isKey && lagUs > 120_000L) {
+                                        requestSyncFrame(c, nowNs)
+                                        continue
+                                    }
+
+                                    val packet = if (isKey) prefixConfig(annexB) else annexB
+                                    val pts = videoPtsOffset90k + (normalizedPtsUs * 90L / 1000L)
+                                    lastVideoPts90k = pts
+                                    broadcaster.publishVideo(packet, pts, isKey)
+                                }
                             }
+                        } finally {
+                            try { c.releaseOutputBuffer(index, false) } catch (_: Throwable) {}
                         }
-                        c.releaseOutputBuffer(index, false)
                         if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break
                     }
                 }
             } catch (t: Throwable) {
-                if (running) onFailure(t)
+                if (!running) break
+                val codecError = t as? MediaCodec.CodecException
+                if (codecError != null && (codecError.isRecoverable || codecError.isTransient)) {
+                    if (recoverCodec()) continue
+                }
+                onFailure(t)
                 break
             }
         }
     }
 
-    private fun maybeAdaptBitrate(c: MediaCodec, lagUs: Long, nowNs: Long) {
-        val tooLate = lateStreak >= 3 || lagUs >= 250_000L
+    private fun requestSyncFrame(c: MediaCodec, nowNs: Long) {
+        if (nowNs - lastSyncRequestNs <= 700_000_000L) return
+        try {
+            c.setParameters(Bundle().apply {
+                putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+            })
+        } catch (_: Throwable) {
+        }
+        lastSyncRequestNs = nowNs
+    }
+
+    private fun maybeAdaptBitrate(c: MediaCodec, lagUs: Long, nowNs: Long, networkPressure: Boolean) {
+        val tooLate = lateStreak >= 3 || lagUs >= 300_000L || networkPressure
         if (tooLate && nowNs - lastBitrateChangeNs > 1_500_000_000L) {
             val next = (currentBitrate * 0.75).toInt().coerceAtLeast(900_000)
             if (next < currentBitrate) {
@@ -246,6 +325,7 @@ class H264Encoder(
                         putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, next)
                     })
                     currentBitrate = next
+                    broadcaster.setTargetVideoBitrate(next)
                     lastBitrateChangeNs = nowNs
                     healthySinceNs = Long.MIN_VALUE
                 } catch (_: Throwable) {
@@ -266,6 +346,7 @@ class H264Encoder(
                     putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, next)
                 })
                 currentBitrate = next
+                broadcaster.setTargetVideoBitrate(next)
                 lastBitrateChangeNs = nowNs
                 healthySinceNs = nowNs
             } catch (_: Throwable) {
@@ -274,14 +355,41 @@ class H264Encoder(
         }
     }
 
-    private fun sleepMicros(micros: Long) {
-        if (micros <= 0L) return
-        try {
-            val millis = micros / 1_000L
-            val nanos = ((micros % 1_000L) * 1_000L).toInt()
-            if (millis > 0L || nanos > 0) Thread.sleep(millis, nanos)
-        } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
+    /** Replace only codec/surface. MediaProjection and its VirtualDisplay remain the same capture session. */
+    @Synchronized
+    private fun recoverCodec(): Boolean {
+        if (!running) return false
+        return try {
+            broadcaster.resetLiveForCodecRecovery()
+
+            val oldCodec = codec
+            val oldSurface = inputSurface
+            codec = null
+            inputSurface = null
+            try { oldSurface?.release() } catch (_: Exception) {}
+            try { oldCodec?.stop() } catch (_: Exception) {}
+            try { oldCodec?.release() } catch (_: Exception) {}
+
+            val replacement = createConfiguredCodec()
+            val replacementSurface = replacement.createInputSurface()
+            replacement.start()
+            codec = replacement
+            inputSurface = replacementSurface
+            virtualDisplay?.setSurface(replacementSurface)
+
+            if (lastVideoPts90k >= 0L) {
+                videoPtsOffset90k = lastVideoPts90k + (90_000L / fps.coerceAtLeast(1))
+            }
+            sps = null
+            pps = null
+            resetClock()
+            lastSyncRequestNs = 0L
+            lastClientDrops = broadcaster.droppedClientPackets
+            recoveries++
+            requestSyncFrame(replacement, System.nanoTime())
+            true
+        } catch (_: Throwable) {
+            false
         }
     }
 
@@ -290,8 +398,8 @@ class H264Encoder(
         val originalPosition = buffer.position()
         buffer.get(bytes)
         try { buffer.position(originalPosition) } catch (_: Exception) {}
-
         if (bytes.isEmpty()) return
+
         if (isAnnexB(bytes)) {
             for (nal in splitAnnexB(bytes)) {
                 if (nal.isEmpty()) continue
@@ -316,9 +424,9 @@ class H264Encoder(
     private fun extractConfig(data: ByteArray): Pair<ByteArray?, ByteArray?> {
         if (isAnnexB(data)) {
             val nals = splitAnnexB(data)
-            return nals.firstOrNull { (it[0].toInt() and 0x1F) == 7 } to nals.firstOrNull { (it[0].toInt() and 0x1F) == 8 }
+            return nals.firstOrNull { it.isNotEmpty() && (it[0].toInt() and 0x1F) == 7 } to
+                nals.firstOrNull { it.isNotEmpty() && (it[0].toInt() and 0x1F) == 8 }
         }
-        // AVCDecoderConfigurationRecord (AVCC).
         if (data.size >= 7 && data[0].toInt() == 1) {
             var p = 5
             val spsCount = data[p++].toInt() and 0x1F
@@ -328,8 +436,7 @@ class H264Encoder(
                     val len = ((data[p].toInt() and 0xFF) shl 8) or (data[p + 1].toInt() and 0xFF)
                     p += 2
                     if (p + len <= data.size) {
-                        val value = data.copyOfRange(p, p + len)
-                        if (spsValue == null) spsValue = value
+                        if (spsValue == null) spsValue = data.copyOfRange(p, p + len)
                         p += len
                     }
                 }
@@ -342,8 +449,7 @@ class H264Encoder(
                         val len = ((data[p].toInt() and 0xFF) shl 8) or (data[p + 1].toInt() and 0xFF)
                         p += 2
                         if (p + len <= data.size) {
-                            val value = data.copyOfRange(p, p + len)
-                            if (ppsValue == null) ppsValue = value
+                            if (ppsValue == null) ppsValue = data.copyOfRange(p, p + len)
                             p += len
                         }
                     }
@@ -355,14 +461,27 @@ class H264Encoder(
     }
 
     private fun prefixConfig(annexB: ByteArray): ByteArray {
-        if (sps == null || pps == null) return annexB
-        return byteArrayOf(*startCode(), *sps!!, *startCode(), *pps!!, *annexB)
+        val s = sps ?: return annexB
+        val p = pps ?: return annexB
+        val sc = 4
+        val out = ByteArray(sc + s.size + sc + p.size + annexB.size)
+        var pos = 0
+        out[pos++] = 0; out[pos++] = 0; out[pos++] = 0; out[pos++] = 1
+        System.arraycopy(s, 0, out, pos, s.size)
+        pos += s.size
+        out[pos++] = 0; out[pos++] = 0; out[pos++] = 0; out[pos++] = 1
+        System.arraycopy(p, 0, out, pos, p.size)
+        pos += p.size
+        System.arraycopy(annexB, 0, out, pos, annexB.size)
+        return out
     }
 
     private fun normalizeH264(data: ByteArray): ByteArray {
         if (isAnnexB(data)) return data
-        val out = java.io.ByteArrayOutputStream(data.size + 64)
+
         var p = 0
+        var total = 0
+        var count = 0
         while (p + 4 <= data.size) {
             val len = ((data[p].toInt() and 0xFF) shl 24) or
                 ((data[p + 1].toInt() and 0xFF) shl 16) or
@@ -370,22 +489,39 @@ class H264Encoder(
                 (data[p + 3].toInt() and 0xFF)
             p += 4
             if (len <= 0 || p + len > data.size) break
-            out.write(startCode())
-            out.write(data, p, len)
+            total += 4 + len
+            count++
             p += len
         }
-        return if (out.size() > 0) out.toByteArray() else data
+        if (count == 0 || total <= 0) return data
+
+        val out = ByteArray(total)
+        p = 0
+        var w = 0
+        repeat(count) {
+            val len = ((data[p].toInt() and 0xFF) shl 24) or
+                ((data[p + 1].toInt() and 0xFF) shl 16) or
+                ((data[p + 2].toInt() and 0xFF) shl 8) or
+                (data[p + 3].toInt() and 0xFF)
+            p += 4
+            out[w++] = 0; out[w++] = 0; out[w++] = 0; out[w++] = 1
+            System.arraycopy(data, p, out, w, len)
+            w += len
+            p += len
+        }
+        return out
     }
 
     private fun isAnnexB(data: ByteArray): Boolean =
-        data.size >= 4 && ((data[0].toInt() == 0 && data[1].toInt() == 0 && data[2].toInt() == 1) ||
-            (data[0].toInt() == 0 && data[1].toInt() == 0 && data[2].toInt() == 0 && data[3].toInt() == 1))
+        data.size >= 4 &&
+            ((data[0].toInt() == 0 && data[1].toInt() == 0 && data[2].toInt() == 1) ||
+                (data[0].toInt() == 0 && data[1].toInt() == 0 && data[2].toInt() == 0 && data[3].toInt() == 1))
 
     private fun splitAnnexB(data: ByteArray): List<ByteArray> {
-        val result = mutableListOf<ByteArray>()
+        val result = ArrayList<ByteArray>()
         var start = findStartCode(data, 0)
         while (start >= 0) {
-            val codeLen = if (start + 3 < data.size && data[start + 2].toInt() == 1) 3 else 4
+            val codeLen = if (start + 2 < data.size && data[start + 2].toInt() == 1) 3 else 4
             val nalStart = start + codeLen
             val next = findStartCode(data, nalStart)
             val end = if (next >= 0) next else data.size
@@ -399,15 +535,23 @@ class H264Encoder(
         var i = from
         while (i + 3 < data.size) {
             if (data[i].toInt() == 0 && data[i + 1].toInt() == 0 &&
-                ((data[i + 2].toInt() == 1) || (i + 3 < data.size && data[i + 2].toInt() == 0 && data[i + 3].toInt() == 1))) return i
+                (data[i + 2].toInt() == 1 ||
+                    (data[i + 2].toInt() == 0 && data[i + 3].toInt() == 1))) {
+                return i
+            }
             i++
         }
         return -1
     }
 
-    private fun containsIdr(data: ByteArray): Boolean =
-        splitAnnexB(data).any { it.isNotEmpty() && (it[0].toInt() and 0x1F) == 5 }
-
-    private fun startCode() = byteArrayOf(0, 0, 0, 1)
-
+    private fun containsIdrFast(data: ByteArray): Boolean {
+        var start = findStartCode(data, 0)
+        while (start >= 0) {
+            val codeLen = if (start + 2 < data.size && data[start + 2].toInt() == 1) 3 else 4
+            val nalStart = start + codeLen
+            if (nalStart < data.size && (data[nalStart].toInt() and 0x1F) == 5) return true
+            start = findStartCode(data, nalStart)
+        }
+        return false
+    }
 }

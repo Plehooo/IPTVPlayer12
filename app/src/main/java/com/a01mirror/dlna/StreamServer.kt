@@ -4,18 +4,18 @@ import android.content.ContentResolver
 import android.content.ContentValues
 import android.content.Context
 import android.os.Environment
+import android.os.Process
 import android.provider.MediaStore
+import java.io.BufferedOutputStream
 import java.io.BufferedReader
 import java.io.IOException
 import java.io.InputStreamReader
-import java.io.BufferedOutputStream
 import java.io.OutputStream
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
-import android.os.Process
 import java.nio.charset.StandardCharsets
 import java.text.SimpleDateFormat
 import java.util.Collections
@@ -24,9 +24,13 @@ import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.TimeUnit
 
-/** 188 * 32 byte, sama dengan ukuran baca ffmpeg->TS di tar v6. */
 private const val TS_CHUNK_BYTES = 188 * 32
+private const val CLIENT_QUEUE_CAPACITY = 4
+private const val MAX_CLIENT_PACKET_AGE_NS = 180_000_000L
+private const val RECORD_QUEUE_MAX_BYTES = 2L * 1024L * 1024L
+private const val TARGET_AUDIO_BITRATE = 128_000L
 private val CRLF = byteArrayOf(13, 10)
 
 class TsBroadcaster(
@@ -37,16 +41,22 @@ class TsBroadcaster(
     private var output: OutputStream? = null
     private var pendingUri = android.net.Uri.EMPTY
     private var lastTablesNs = 0L
+
     @Volatile private var latestKeyFrameTs: ByteArray? = null
-    private var recordingFailed = false
+    @Volatile private var targetVideoBitrate = 2_000_000L
+    @Volatile private var recordingFailed = false
     private val recordingQueue = ArrayBlockingQueue<ByteArray>(256)
+    @Volatile private var recordingQueuedBytes = 0L
     @Volatile private var recordingRunning = false
     private var recordingThread: Thread? = null
 
-    /** Byte TS & frame video yang sudah dihasilkan; dipakai menunggu data pertama sebelum Play. */
     @Volatile var bytesPublished: Long = 0L
         private set
     @Volatile var videoFrames: Long = 0L
+        private set
+    @Volatile var droppedVideoFrames: Long = 0L
+        private set
+    @Volatile var droppedClientPackets: Long = 0L
         private set
 
     val sessionToken: String = UUID.randomUUID().toString().replace("-", "")
@@ -54,6 +64,10 @@ class TsBroadcaster(
     init {
         openRecording()
         startRecordingWriter()
+    }
+
+    fun setTargetVideoBitrate(bitrate: Int) {
+        targetVideoBitrate = bitrate.coerceAtLeast(600_000).toLong()
     }
 
     @Synchronized
@@ -72,26 +86,35 @@ class TsBroadcaster(
     @Synchronized
     private fun publish(packet: ByteArray, keyFrame: Boolean) {
         if (packet.isEmpty()) return
-        bytesPublished += packet.size
-        if (System.nanoTime() - lastTablesNs >= 250_000_000L) {
-            writeRecording(muxer.patPacket())
-            writeRecording(muxer.pmtPacket())
-            broadcast(muxer.patPacket(), true)
-            broadcast(muxer.pmtPacket(), true)
-            lastTablesNs = System.nanoTime()
+        bytesPublished += packet.size.toLong()
+
+        val now = System.nanoTime()
+        if (now - lastTablesNs >= 250_000_000L) {
+            val pat = muxer.patPacket()
+            val pmt = muxer.pmtPacket()
+            writeRecording(pat)
+            writeRecording(pmt)
+            // PAT/PMT are control tables, NOT keyframes. Marking them as keyframes
+            // used to flush the 4-slot live queue every 250 ms and caused visible stutter.
+            broadcast(pat, false)
+            broadcast(pmt, false)
+            lastTablesNs = now
         }
-        // Jalur LIVE tidak boleh menunggu penulisan file. Rekaman ditangani thread terpisah
-        // agar I/O MediaStore tidak menahan encoder/stream ketika storage sedang lambat.
+
         writeRecording(packet)
         broadcast(packet, keyFrame)
     }
 
+    /** Drop only recording pressure; the live DLNA path is never stopped for a slow disk. */
     private fun writeRecording(data: ByteArray) {
         if (output == null || recordingFailed || !recordingRunning) return
-        // Jangan pernah membuat jalur live menunggu disk. 256 item memberi writer beberapa detik
-        // ruang bernapas pada storage yang sesekali lambat.
-        if (!recordingQueue.offer(data)) {
+        val newSize = recordingQueuedBytes + data.size
+        if (newSize > RECORD_QUEUE_MAX_BYTES || !recordingQueue.offer(data)) {
             recordingFailed = true
+            recordingQueue.clear()
+            recordingQueuedBytes = 0L
+        } else {
+            recordingQueuedBytes = newSize
         }
     }
 
@@ -100,12 +123,20 @@ class TsBroadcaster(
         recordingRunning = true
         recordingThread = Thread {
             try {
+                try { Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND) } catch (_: Throwable) {}
+                var lastFlushNs = System.nanoTime()
                 while (recordingRunning || recordingQueue.isNotEmpty()) {
-                    val data = recordingQueue.poll(250, java.util.concurrent.TimeUnit.MILLISECONDS) ?: continue
+                    val data = recordingQueue.poll(250, TimeUnit.MILLISECONDS) ?: continue
+                    recordingQueuedBytes = (recordingQueuedBytes - data.size).coerceAtLeast(0L)
                     val out = output ?: break
                     if (!recordingFailed) {
                         try {
                             out.write(data)
+                            val now = System.nanoTime()
+                            if (now - lastFlushNs >= 750_000_000L) {
+                                out.flush()
+                                lastFlushNs = now
+                            }
                         } catch (_: IOException) {
                             recordingFailed = true
                         }
@@ -130,28 +161,43 @@ class TsBroadcaster(
     }
 
     @Synchronized
+    fun resetLiveForCodecRecovery() {
+        latestKeyFrameTs = null
+        for (client in clients) client.resetForRecovery()
+    }
+
+    @Synchronized
     fun attach(socket: Socket, outputStream: OutputStream) {
         try {
             socket.tcpNoDelay = true
             socket.keepAlive = true
-            socket.sendBufferSize = 32 * 1024
-            socket.receiveBufferSize = 32 * 1024
-        } catch (_: Exception) {
-        }
+            socket.sendBufferSize = 16 * 1024
+            socket.receiveBufferSize = 16 * 1024
+        } catch (_: Exception) {}
         try { socket.trafficClass = 0x10 } catch (_: Exception) {}
-        val client = Client(socket, outputStream)
-        if (!client.offer(muxer.patPacket(), true) || !client.offer(muxer.pmtPacket(), true)) {
+
+        val client = Client(
+            socket,
+            outputStream,
+            { targetVideoBitrate + TARGET_AUDIO_BITRATE },
+            { droppedClientPackets += 1L }
+        )
+        try {
+            // Bootstrap synchronously: A01 receives PAT/PMT + the newest IDR before
+            // the asynchronous live writer begins, avoiding an extra startup backlog.
+            client.bootstrap(muxer.patPacket(), muxer.pmtPacket(), latestKeyFrameTs)
+            clients.add(client)
+            client.start()
+        } catch (_: Throwable) {
             client.close()
-            return
         }
-        latestKeyFrameTs?.let { key ->
-            if (!client.offer(key, true)) {
-                client.close()
-                return
-            }
-        }
-        clients.add(client)
-        client.start()
+    }
+
+    @Synchronized
+    fun trimRecordingPressure() {
+        recordingQueue.clear()
+        recordingQueuedBytes = 0L
+        recordingFailed = true
     }
 
     @Synchronized
@@ -164,6 +210,7 @@ class TsBroadcaster(
         try { recordingThread?.join(900) } catch (_: InterruptedException) {}
         recordingThread = null
         recordingQueue.clear()
+        recordingQueuedBytes = 0L
 
         try { output?.flush() } catch (_: Exception) {}
         try { output?.close() } catch (_: Exception) {}
@@ -173,14 +220,11 @@ class TsBroadcaster(
             try {
                 resolver.update(
                     pendingUri,
-                    ContentValues().apply {
-                        put(MediaStore.Downloads.IS_PENDING, 0)
-                    },
+                    ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) },
                     null,
                     null
                 )
-            } catch (_: Exception) {
-            }
+            } catch (_: Exception) {}
         }
         pendingUri = android.net.Uri.EMPTY
     }
@@ -195,8 +239,7 @@ class TsBroadcaster(
         }
 
         pendingUri = try {
-            resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                ?: android.net.Uri.EMPTY
+            resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: android.net.Uri.EMPTY
         } catch (_: Exception) {
             android.net.Uri.EMPTY
         }
@@ -204,78 +247,149 @@ class TsBroadcaster(
         output = if (pendingUri != android.net.Uri.EMPTY) {
             try {
                 resolver.openOutputStream(pendingUri, "w")?.let { BufferedOutputStream(it, 64 * 1024) }
-            } catch (_: Exception) { null }
+            } catch (_: Exception) {
+                null
+            }
         } else null
     }
 
     private class Client(
         private val socket: Socket,
-        private val output: OutputStream
+        outputStream: OutputStream,
+        private val bitrateProvider: () -> Long,
+        private val onDrop: () -> Unit
     ) {
+        private val output: OutputStream = BufferedOutputStream(outputStream, 16 * 1024)
+
         private data class QueuedPacket(
             val data: ByteArray,
             val keyFrame: Boolean,
             val enqueuedNs: Long
         )
 
-        // Tetap 4 slot seperti versi sebelumnya, tetapi sekarang setiap item membawa timestamp.
-        // Queue penuh tidak boleh berubah menjadi buffer beberapa detik.
-        private val queue = ArrayBlockingQueue<QueuedPacket>(4)
+        private val queue = ArrayBlockingQueue<QueuedPacket>(CLIENT_QUEUE_CAPACITY)
         @Volatile private var closed = false
         private var writer: Thread? = null
-        private val maxPacketAgeNs = 180_000_000L
+        private var nextWireNs = 0L
+
+        fun bootstrap(pat: ByteArray, pmt: ByteArray, keyFrame: ByteArray?) {
+            writeChunked(pat)
+            writeChunked(pmt)
+            keyFrame?.let(::writeChunked)
+            output.flush()
+        }
 
         fun offer(bytes: ByteArray, keyFrame: Boolean): Boolean {
             if (closed) return false
             val item = QueuedPacket(bytes, keyFrame, System.nanoTime())
             if (queue.offer(item)) return true
 
-            // Keyframe adalah titik recovery decoder: bila datang, buang backlog lama dan mulai
-            // dari keyframe baru. Untuk frame biasa, cukup buang frame baru agar queue tidak membesar.
             if (keyFrame) {
+                if (queue.isNotEmpty()) onDrop()
                 queue.clear()
                 return queue.offer(item)
             }
+
+            // Keep the newest live data. Prefer removing an old non-keyframe packet
+            // rather than preserving stale data just because it arrived first.
+            val iterator = queue.iterator()
+            var removed = false
+            while (iterator.hasNext()) {
+                val old = iterator.next()
+                if (!old.keyFrame) {
+                    removed = queue.remove(old)
+                    if (removed) {
+                        onDrop()
+                        break
+                    }
+                }
+            }
+            if (removed) return queue.offer(item)
+            onDrop()
             return true
+        }
+
+        fun resetForRecovery() {
+            queue.clear()
+            nextWireNs = 0L
         }
 
         fun start() {
             writer = Thread {
                 try {
-                    Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY)
-                } catch (_: Throwable) {
-                }
+                    Process.setThreadPriority(Process.THREAD_PRIORITY_DEFAULT)
+                } catch (_: Throwable) {}
+
                 try {
                     while (!closed) {
                         val queued = queue.take()
                         val age = System.nanoTime() - queued.enqueuedNs
-                        if (!queued.keyFrame && age > maxPacketAgeNs) {
-                            continue
-                        }
-                        val packet = queued.data
-                        var offset = 0
-                        while (offset < packet.size) {
-                            val len = minOf(TS_CHUNK_BYTES, packet.size - offset)
-                            val head = (Integer.toHexString(len) + "\r\n").toByteArray(StandardCharsets.US_ASCII)
-                            // Hindari membuat ByteArray gabungan baru pada setiap chunk: lebih sedikit
-                            // allocation/GC berarti encoder lebih kecil kemungkinannya tersendat saat
-                            // aplikasi berat dibuka.
-                            output.write(head)
-                            output.write(packet, offset, len)
-                            output.write(CRLF)
-                            output.flush()
-                            offset += len
+                        if (!queued.keyFrame && age > MAX_CLIENT_PACKET_AGE_NS) continue
+
+                        // If the client has no backlog, don't manufacture latency. If it has
+                        // backlog, smooth the wire rate close to the actual multiplexed bitrate
+                        // so the A01 doesn't receive a huge burst that its player then buffers.
+                        if (queue.isNotEmpty() || nextWireNs > System.nanoTime()) {
+                            paceAndWrite(queued.data)
+                        } else {
+                            writeChunked(queued.data)
+                            nextWireNs = System.nanoTime()
                         }
                     }
                 } catch (_: InterruptedException) {
                     Thread.currentThread().interrupt()
-                } catch (_: Exception) {
+                } catch (_: Throwable) {
                     close()
                 }
             }.also {
                 it.name = "A01-DLNA-client"
                 it.start()
             }
+        }
+
+        private fun paceAndWrite(packet: ByteArray) {
+            var offset = 0
+            val rateBytesPerSec = (bitrateProvider().coerceAtLeast(700_000L) * 1.20 / 8.0).toLong().coerceAtLeast(1L)
+            var schedule = maxOf(nextWireNs, System.nanoTime())
+            while (offset < packet.size && !closed) {
+                val len = minOf(TS_CHUNK_BYTES, packet.size - offset)
+                val durationNs = (len.toDouble() * 1_000_000_000.0 / rateBytesPerSec).toLong().coerceAtLeast(100_000L)
+                val now = System.nanoTime()
+                val waitNs = schedule - now
+                if (waitNs > 0) sleepNanos(waitNs)
+                writeChunked(packet, offset, len)
+                schedule += durationNs
+                offset += len
+            }
+            output.flush()
+            nextWireNs = maxOf(schedule, System.nanoTime())
+        }
+
+        private fun sleepNanos(ns: Long) {
+            try {
+                val ms = ns / 1_000_000L
+                val nano = (ns % 1_000_000L).toInt()
+                if (ms > 0 || nano > 0) Thread.sleep(ms, nano)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+        }
+
+        private fun writeChunked(packet: ByteArray) {
+            var offset = 0
+            while (offset < packet.size && !closed) {
+                val len = minOf(TS_CHUNK_BYTES, packet.size - offset)
+                writeChunked(packet, offset, len)
+                offset += len
+            }
+            output.flush()
+        }
+
+        private fun writeChunked(packet: ByteArray, offset: Int, len: Int) {
+            val head = (Integer.toHexString(len) + "\r\n").toByteArray(StandardCharsets.US_ASCII)
+            output.write(head)
+            output.write(packet, offset, len)
+            output.write(CRLF)
         }
 
         fun close() {
@@ -334,9 +448,7 @@ class LiveHttpServer(
         Thread {
             try {
                 socket.soTimeout = 4000
-                val reader = BufferedReader(
-                    InputStreamReader(socket.getInputStream(), StandardCharsets.US_ASCII)
-                )
+                val reader = BufferedReader(InputStreamReader(socket.getInputStream(), StandardCharsets.US_ASCII))
                 val requestLine = reader.readLine() ?: run {
                     socket.close()
                     return@Thread
@@ -348,7 +460,7 @@ class LiveHttpServer(
                     if (line.isEmpty()) break
                     val index = line.indexOf(':')
                     if (index > 0) {
-                        headers[line.substring(0, index).trim().lowercase()] =
+                        headers[line.substring(0, index).trim().lowercase(Locale.US)] =
                             line.substring(index + 1).trim()
                     }
                 }
@@ -371,14 +483,14 @@ class LiveHttpServer(
                     return@Thread
                 }
 
-                // Header disamakan dengan begin_stream() di tar v6 (yang jalan di STB):
-                // HTTP/1.1 chunked + contentFeatures/transferMode DLNA yang benar.
+                // Match the working A01 v6 Termux server: chunked HTTP live stream,
+                // no-cache, Streaming transfer mode, and Connection: close semantics.
                 val header = buildString {
                     append("HTTP/1.1 200 OK\r\n")
                     append("Content-Type: video/mpeg\r\n")
                     append("Cache-Control: no-cache, no-store, must-revalidate\r\n")
                     append("Pragma: no-cache\r\n")
-                    append("Connection: keep-alive\r\n")
+                    append("Connection: close\r\n")
                     append("Transfer-Encoding: chunked\r\n")
                     append("transferMode.dlna.org: Streaming\r\n")
                     append("contentFeatures.dlna.org: ").append(DlnaController.DLNA_FEATURES).append("\r\n")
@@ -392,13 +504,11 @@ class LiveHttpServer(
                     return@Thread
                 }
 
-                // Range probing is intentionally ignored: this is a live source with no fixed length.
                 broadcaster.attach(socket, output)
-
                 while (running && !socket.isClosed) {
                     Thread.sleep(1000)
                 }
-            } catch (_: Exception) {
+            } catch (_: Throwable) {
                 try { socket.close() } catch (_: Exception) {}
             }
         }.also {
@@ -426,11 +536,8 @@ class LiveHttpServer(
 }
 
 fun localIpv4(context: Context): String {
-    // Prefer the active Wi-Fi/Ethernet link so the URL advertised to the DLNA box
-    // is not accidentally built from a VPN/cellular interface.
     try {
-        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE)
-            as android.net.ConnectivityManager
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
         val network = cm.activeNetwork
         val caps = network?.let(cm::getNetworkCapabilities)
         if (network != null && caps != null && (
@@ -464,10 +571,5 @@ fun localIpv4(context: Context): String {
     }
 }
 
-/**
- * IP HP yang dilihat STB. Memakai soket UDP "connect" ke IP STB (seperti local_ip_for_renderer()
- * di tar v6) sehingga benar untuk Wi-Fi biasa maupun hotspot HP; kalau gagal baru pakai
- * pencarian interface biasa.
- */
 fun localIpv4For(context: Context, remoteHost: String): String =
     DlnaController.localAddressToward(remoteHost) ?: localIpv4(context)

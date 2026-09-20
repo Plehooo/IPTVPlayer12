@@ -146,6 +146,15 @@ class MirrorService : Service() {
         }
     }
 
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        // Under memory pressure, sacrifice only the optional recording backlog.
+        // The live DLNA path remains active.
+        if (level >= android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) {
+            try { broadcaster?.trimRecordingPressure() } catch (_: Exception) {}
+        }
+    }
+
     override fun onDestroy() {
         val r = renderer
         if (r != null) {
