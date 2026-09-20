@@ -1,79 +1,72 @@
-# A01 Mirror — Android → Advance STP-A01 (DLNA)
+# A01 Mirror
 
-A prototype Android app for local-network screen mirroring to an Advance STP-A01 via DLNA.
+Android screen mirroring + local recording aimed at an Advance STP-A01 DLNA renderer.
 
-## What it does
+## Design
 
-- Discovers DLNA MediaRenderer devices using SSDP.
-- Requests Android screen-capture permission with MediaProjection.
-- Captures the phone screen as H.264.
-- Captures app playback audio when Android/app policy allows it, then encodes MP3.
-- Muxes H.264 + MPEG audio into a live MPEG-TS stream.
-- Hosts that stream over HTTP on the phone.
-- Tells the selected DLNA renderer to open the URL using UPnP AVTransport.
-- Saves the same MPEG-TS stream as a recording in the Android MediaStore (`Movies/A01Mirror`).
+The app captures the phone display with Android MediaProjection, encodes H.264, captures eligible app playback audio with Android AudioPlaybackCapture, encodes MPEG-1 Layer III, muxes both into 188-byte MPEG-TS, serves the live stream over HTTP, and asks a DLNA renderer to play that URI with UPnP AVTransport.
 
-## Important compatibility note
+The same transport stream is recorded to `Download/A01Mirror` through MediaStore.
 
-This is **DLNA renderer streaming**, not Miracast. The STP-A01 specification lists DLNA support plus H.264 video and MPEG-1/2 Layer I/II/III audio decoding, so H.264 + MPEG audio in MPEG-TS is used as the compatibility target.
+### Important capability limits
 
-The A01 firmware documentation does not guarantee that every firmware revision accepts a continuously generated local HTTP MPEG-TS URL through AVTransport. If the box refuses the live stream, that is a renderer/firmware limitation rather than a normal Android screen-capture limitation.
+This is **DLNA streaming, not Miracast**. A DLNA renderer must accept a continuously generated local HTTP MPEG-TS URI through its AVTransport implementation. The STP-A01 documentation lists DLNA plus H.264 and MPEG-1/2 Layer I/II/III decoding, which is why the stream is built around H.264 + MPEG-1 Layer III. Actual acceptance of a live local stream is firmware-dependent.
 
-## Recommended test setup
+Android playback capture is policy-controlled. An app may allow or block its audio from being captured, and protected/secure content may also restrict capture. Video can therefore work while internal audio is silent for a particular source app.
 
-1. Connect the A01 to Wi-Fi using its supported Wi-Fi dongle.
-2. Put the Android phone and A01 on the same LAN/Wi-Fi.
-3. Open the A01's DLNA/network-media feature.
-4. Install the APK.
-5. Tap **Scan DLNA** and select the STP-A01 renderer.
-6. Select 1280×720 / 30 FPS first.
-7. Tap **Mulai Mirror + Rekam** and allow screen capture (and audio capture if requested).
-8. Rotate YouTube/game to landscape; the TV should keep a 16:9 presentation without stretching. Portrait content will be letterboxed rather than distorted.
+The output canvas is kept in a TV-friendly landscape aspect ratio. Android's projection scaling preserves the captured content's aspect ratio, so portrait content is fitted rather than stretched; landscape content fills the normal 16:9 canvas when started in landscape.
 
-## Android audio limitation
+## GitHub build — no Android SDK needed on the phone
 
-Android playback capture only works for audio usages/apps that permit capture. Some apps, DRM-protected media, or secure content may intentionally block capture. The video capture can therefore succeed while internal audio is silent.
+The repository includes a GitHub Actions workflow. GitHub-hosted runners install Java and Gradle and build the APK automatically.
 
-## Build in Termux
-
-The project is intentionally wrapper-free so it can be built with an installed Gradle.
+1. Create an empty GitHub repository.
+2. From Termux, extract this project and push it:
 
 ```bash
-pkg install git gradle
-# Ensure Java 17 is available on your Termux installation.
-java -version
-gradle --version
+cd ~/storage/downloads
+unzip A01Mirror-FINAL.zip
+cd A01Mirror
 
-cd ~/storage/downloads/A01Mirror
-gradle assembleDebug --stacktrace
-```
-
-APK output:
-
-```text
-app/build/outputs/apk/debug/app-debug.apk
-```
-
-## Push to GitHub from Termux
-
-Create an empty GitHub repository first, then:
-
-```bash
-cd ~/storage/downloads/A01Mirror
 git init
 git branch -M main
 git add .
-git commit -m "Initial A01 DLNA mirror app"
+git commit -m "A01 Mirror initial release"
 git remote add origin https://github.com/USERNAME/A01Mirror.git
 git push -u origin main
 ```
 
-After that, GitHub Actions builds the debug APK automatically and publishes it under the workflow run's **Artifacts**.
+3. Open GitHub → **Actions** → **Build A01 Mirror APK**.
+4. Open the successful workflow run and download the `A01Mirror-debug` artifact.
 
-## Project limitations
+The workflow deliberately pins AGP 9.4.0, Gradle 9.6 and JDK 17. AGP 9.4 lists Gradle 9.6 and JDK 17 as its default compatibility versions. See the official Android Gradle Plugin 9.4 release notes.
 
-- No Android device can capture another app's audio if the source app disallows playback capture.
-- Android secure/DRM surfaces may not be capturable.
-- DLNA discovery/AVTransport behavior is vendor/firmware dependent.
-- A real DLNA renderer is required; a device that only exposes a DLNA player/client is not enough.
-- The phone and A01 must be reachable on the same LAN; client isolation/AP isolation can break the stream.
+## Android build configuration
+
+AGP 9+ has built-in Kotlin support, so this project intentionally does **not** apply `org.jetbrains.kotlin.android`. This avoids the duplicate `kotlin` extension error that occurs when the old Kotlin Android plugin is applied on top of AGP built-in Kotlin.
+
+The app targets API 35 and compiles against API 36. The only native third-party dependency is TAndroidLame 1.1 for MPEG Layer III encoding.
+
+## First test
+
+Use the same Wi-Fi/LAN for the phone and STP-A01. Enable the A01's DLNA/network-media function, open the app, scan for the renderer, select it, start with **1280×720 / 30 FPS**, approve screen capture and microphone/audio permission, then start mirroring.
+
+Once the end-to-end DLNA path is confirmed on the specific A01 firmware, try 1920×1080 and 60 FPS as a second step.
+
+## Native dependency note
+
+TAndroidLame is a GPL-3.0 project and uses native code. Verify its license obligations before distributing the APK outside personal testing. Its repository is linked below.
+
+- TAndroidLame: https://github.com/naman14/TAndroidLame
+- Android MediaProjection: https://developer.android.com/media/grow/media-projection
+- Android playback capture: https://developer.android.com/media/platform/av-capture
+- Android 16 KB page-size guidance: https://developer.android.com/guide/practices/page-sizes
+
+
+## STB tidak ketemu / IP tidak terbaca
+
+- Pencarian SSDP dikirim per-interface (Wi-Fi, hotspot HP, LAN), jadi tetap jalan walau data seluler jadi jaringan default atau Wi-Fi/hotspot tanpa internet.
+- Isi kolom **IP STB** (angka yang tampil di layar STB) lalu tekan **Cari STB DLNA**. Aplikasi mencoba SSDP unicast ke IP itu, lalu menebak alamat deskripsi UPnP di port/path umum. IP terakhir disimpan otomatis.
+- Bila tetap gagal, laporan pencarian (interface yang dipindai, balasan SSDP, port terbuka) tampil di kolom status.
+- IP HP untuk URL stream dihitung ke arah STB (soket UDP `connect`, sama dengan `local_ip_for_renderer()` di `advance01-media-center-v6`), jadi benar untuk Wi-Fi biasa maupun hotspot HP.
+- Format DLNA (DIDL tanpa `DLNA.ORG_PN`, `OP=01` + `FLAGS`, HTTP/1.1 chunked, header `contentFeatures.dlna.org` / `transferMode.dlna.org`, jeda antara `SetAVTransportURI` dan `Play`, Play baru dikirim setelah ada frame video pertama) disamakan dengan `advance01-media-center-v6`. Default video 720p / 25 fps, H.264 Main, audio MPEG-1 Layer III 48 kHz.

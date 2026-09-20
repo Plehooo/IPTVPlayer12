@@ -2,13 +2,13 @@ package com.a01mirror.dlna
 
 import android.content.ContentResolver
 import android.content.ContentValues
+import android.content.Context
 import android.os.Environment
 import android.provider.MediaStore
 import java.io.BufferedReader
-import java.io.FileOutputStream
 import java.io.IOException
-import java.io.OutputStream
 import java.io.InputStreamReader
+import java.io.OutputStream
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.net.ServerSocket
@@ -20,19 +20,24 @@ import java.util.Collections
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.CopyOnWriteArrayList
 
 class TsBroadcaster(
-    private val resolver: ContentResolver,
-    private val width: Int,
-    private val height: Int
+    private val resolver: ContentResolver
 ) {
     private val muxer = MpegTsMuxer()
     private val clients = CopyOnWriteArrayList<Client>()
-    private val startedAt = System.nanoTime()
-    private var lastTablesNs = 0L
     private var output: OutputStream? = null
     private var pendingUri = android.net.Uri.EMPTY
+    private var lastTablesNs = 0L
+    private var recordingFailed = false
+
+    /** Byte TS & frame video yang sudah dihasilkan; dipakai menunggu data pertama sebelum Play. */
+    @Volatile var bytesPublished: Long = 0L
+        private set
+    @Volatile var videoFrames: Long = 0L
+        private set
 
     val sessionToken: String = UUID.randomUUID().toString().replace("-", "")
 
@@ -42,95 +47,153 @@ class TsBroadcaster(
 
     @Synchronized
     fun publishVideo(accessUnit: ByteArray, pts90k: Long, keyFrame: Boolean) {
-        val packet = muxer.videoPes(accessUnit, pts90k, keyFrame)
-        publish(packet)
+        publish(muxer.videoPes(accessUnit, pts90k, keyFrame))
+        videoFrames += 1
     }
 
     @Synchronized
     fun publishAudio(mp3: ByteArray, pts90k: Long) {
-        if (mp3.isEmpty()) return
-        val packet = muxer.audioPes(mp3, pts90k)
-        publish(packet)
+        if (mp3.isNotEmpty()) publish(muxer.audioPes(mp3, pts90k))
     }
 
     @Synchronized
     private fun publish(packet: ByteArray) {
-        if (System.nanoTime() - lastTablesNs > 500_000_000L) {
-            publishRaw(muxer.patPacket())
-            publishRaw(muxer.pmtPacket())
+        if (packet.isEmpty()) return
+        bytesPublished += packet.size
+        if (System.nanoTime() - lastTablesNs >= 500_000_000L) {
+            writeRecording(muxer.patPacket())
+            writeRecording(muxer.pmtPacket())
+            broadcast(muxer.patPacket())
+            broadcast(muxer.pmtPacket())
             lastTablesNs = System.nanoTime()
         }
-        publishRaw(packet)
+        writeRecording(packet)
+        broadcast(packet)
     }
 
-    private fun publishRaw(data: ByteArray) {
-        output?.let {
-            try {
-                it.write(data)
-                it.flush()
-            } catch (_: IOException) {
-            }
+    private fun writeRecording(data: ByteArray) {
+        val out = output ?: return
+        if (recordingFailed) return
+        try {
+            out.write(data)
+        } catch (_: IOException) {
+            recordingFailed = true
         }
+    }
 
+    private fun broadcast(data: ByteArray) {
         for (client in clients) {
-            try {
-                client.output.write(data)
-                client.output.flush()
-            } catch (_: IOException) {
+            if (!client.offer(data)) {
                 client.close()
                 clients.remove(client)
             }
         }
     }
 
-    fun attach(socket: Socket, output: OutputStream) {
-        val client = Client(socket, output)
-        clients.add(client)
-        try {
-            output.write(muxer.patPacket())
-            output.write(muxer.pmtPacket())
-            output.flush()
-        } catch (_: IOException) {
+    @Synchronized
+    fun attach(socket: Socket, outputStream: OutputStream) {
+        val client = Client(socket, outputStream)
+        if (!client.offer(muxer.patPacket()) || !client.offer(muxer.pmtPacket())) {
             client.close()
-            clients.remove(client)
+            return
         }
+        clients.add(client)
+        client.start()
     }
 
+    @Synchronized
     fun close() {
         for (client in clients) client.close()
         clients.clear()
-        synchronized(this) {
-            try { output?.flush() } catch (_: Exception) {}
-            try { output?.close() } catch (_: Exception) {}
-            output = null
-            if (!pendingUri.equals(android.net.Uri.EMPTY)) {
-                resolver.update(pendingUri, ContentValues().apply {
-                    put(MediaStore.Video.Media.IS_PENDING, 0)
-                }, null, null)
+
+        try { output?.flush() } catch (_: Exception) {}
+        try { output?.close() } catch (_: Exception) {}
+        output = null
+
+        if (pendingUri != android.net.Uri.EMPTY) {
+            try {
+                resolver.update(
+                    pendingUri,
+                    ContentValues().apply {
+                        put(MediaStore.Downloads.IS_PENDING, 0)
+                    },
+                    null,
+                    null
+                )
+            } catch (_: Exception) {
             }
         }
+        pendingUri = android.net.Uri.EMPTY
     }
 
     private fun openRecording() {
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         val values = ContentValues().apply {
-            put(MediaStore.Video.Media.DISPLAY_NAME, "A01Mirror_${stamp}.ts")
-            put(MediaStore.Video.Media.MIME_TYPE, "video/mp2t")
-            put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/A01Mirror")
-            put(MediaStore.Video.Media.IS_PENDING, 1)
+            put(MediaStore.Downloads.DISPLAY_NAME, "A01Mirror_$stamp.ts")
+            put(MediaStore.Downloads.MIME_TYPE, "video/mp2t")
+            put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/A01Mirror")
+            put(MediaStore.Downloads.IS_PENDING, 1)
         }
-        pendingUri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values) ?: android.net.Uri.EMPTY
-        output = if (!pendingUri.equals(android.net.Uri.EMPTY)) {
-            resolver.openOutputStream(pendingUri, "w")
-        } else {
-            null
+
+        pendingUri = try {
+            resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                ?: android.net.Uri.EMPTY
+        } catch (_: Exception) {
+            android.net.Uri.EMPTY
         }
+
+        output = if (pendingUri != android.net.Uri.EMPTY) {
+            try { resolver.openOutputStream(pendingUri, "w") } catch (_: Exception) { null }
+        } else null
     }
 
-    private data class Client(val socket: Socket, val output: OutputStream) {
+    private class Client(
+        private val socket: Socket,
+        private val output: OutputStream
+    ) {
+        private val queue = ArrayBlockingQueue<ByteArray>(96)
+        @Volatile private var closed = false
+        private var writer: Thread? = null
+
+        fun offer(bytes: ByteArray): Boolean {
+            if (closed) return false
+            // Clone because the caller may reuse its buffer after this method returns.
+            return queue.offer(bytes.copyOf())
+        }
+
+        fun start() {
+            writer = Thread {
+                try {
+                    while (!closed) {
+                        val packet = queue.take()
+                        // HTTP/1.1 chunked, sama seperti send_chunk() di tar v6.
+                        val head = (Integer.toHexString(packet.size) + "\r\n").toByteArray(StandardCharsets.US_ASCII)
+                        val frame = ByteArray(head.size + packet.size + 2)
+                        System.arraycopy(head, 0, frame, 0, head.size)
+                        System.arraycopy(packet, 0, frame, head.size, packet.size)
+                        frame[frame.size - 2] = 13
+                        frame[frame.size - 1] = 10
+                        output.write(frame)
+                        output.flush()
+                    }
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                } catch (_: Exception) {
+                    close()
+                }
+            }.also {
+                it.name = "A01-DLNA-client"
+                it.start()
+            }
+        }
+
         fun close() {
+            if (closed) return
+            closed = true
+            try { writer?.interrupt() } catch (_: Exception) {}
             try { output.close() } catch (_: Exception) {}
             try { socket.close() } catch (_: Exception) {}
+            queue.clear()
         }
     }
 }
@@ -162,7 +225,10 @@ class LiveHttpServer(
                 } catch (_: Exception) {
                 }
             }
-        }.also { it.name = "A01-HTTP"; it.start() }
+        }.also {
+            it.name = "A01-HTTP"
+            it.start()
+        }
     }
 
     fun stop() {
@@ -175,59 +241,130 @@ class LiveHttpServer(
 
     private fun handle(socket: Socket) {
         Thread {
-            socket.soTimeout = 3000
             try {
-                val reader = BufferedReader(InputStreamReader(socket.getInputStream(), StandardCharsets.US_ASCII))
-                val first = reader.readLine() ?: run { socket.close(); return@Thread }
-                val headers = HashMap<String, String>()
-                while (true) {
-                    val line = reader.readLine() ?: break
-                    if (line.isEmpty()) break
-                    val i = line.indexOf(':')
-                    if (i > 0) headers[line.substring(0, i).trim().lowercase()] = line.substring(i + 1).trim()
-                }
-
-                val path = first.split(' ').getOrNull(1) ?: ""
-                val expectedPath = "/a01/$token/stream.ts"
-                val output = socket.getOutputStream()
-
-                if (path != expectedPath) {
-                    val body = "A01 Mirror"
-                    output.write(("HTTP/1.1 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ${body.toByteArray().size}\r\nConnection: close\r\n\r\n$body").toByteArray())
-                    output.flush()
+                socket.soTimeout = 4000
+                val reader = BufferedReader(
+                    InputStreamReader(socket.getInputStream(), StandardCharsets.US_ASCII)
+                )
+                val requestLine = reader.readLine() ?: run {
                     socket.close()
                     return@Thread
                 }
 
+                val headers = HashMap<String, String>()
+                while (true) {
+                    val line = reader.readLine() ?: break
+                    if (line.isEmpty()) break
+                    val index = line.indexOf(':')
+                    if (index > 0) {
+                        headers[line.substring(0, index).trim().lowercase()] =
+                            line.substring(index + 1).trim()
+                    }
+                }
+
+                val parts = requestLine.split(' ', limit = 3)
+                val method = parts.getOrNull(0)?.uppercase(Locale.US) ?: ""
+                val requestedPath = parts.getOrNull(1)?.substringBefore('?') ?: ""
+                val expectedPath = "/a01/$token/stream.ts"
+                val output = socket.getOutputStream()
+
+                if (method != "GET" && method != "HEAD") {
+                    writeResponse(output, "405 Method Not Allowed", "text/plain; charset=utf-8", "Method Not Allowed", close = true)
+                    socket.close()
+                    return@Thread
+                }
+
+                if (requestedPath != expectedPath) {
+                    writeResponse(output, "404 Not Found", "text/plain; charset=utf-8", "A01 Mirror", close = true)
+                    socket.close()
+                    return@Thread
+                }
+
+                // Header disamakan dengan begin_stream() di tar v6 (yang jalan di STB):
+                // HTTP/1.1 chunked + contentFeatures/transferMode DLNA yang benar.
                 val header = buildString {
-                    append("HTTP/1.0 200 OK\r\n")
-                    append("Content-Type: video/mp2t\r\n")
-                    append("TransferMode.DLNA.ORG: Streaming\r\n")
-                    append("contentFeatures.dlna.org: DLNA.ORG_OP=00;DLNA.ORG_CI=0\r\n")
+                    append("HTTP/1.1 200 OK\r\n")
+                    append("Content-Type: video/mpeg\r\n")
                     append("Cache-Control: no-cache, no-store, must-revalidate\r\n")
                     append("Pragma: no-cache\r\n")
                     append("Connection: close\r\n")
+                    append("Transfer-Encoding: chunked\r\n")
+                    append("transferMode.dlna.org: Streaming\r\n")
+                    append("contentFeatures.dlna.org: ").append(DlnaController.DLNA_FEATURES).append("\r\n")
                     append("\r\n")
                 }
                 output.write(header.toByteArray(StandardCharsets.US_ASCII))
                 output.flush()
+
+                if (method == "HEAD") {
+                    socket.close()
+                    return@Thread
+                }
+
+                // Range probing is intentionally ignored: this is a live source with no fixed length.
                 broadcaster.attach(socket, output)
-                // Keep this handler alive while the broadcaster writes to its socket.
-                while (running && !socket.isClosed) Thread.sleep(1000)
+
+                while (running && !socket.isClosed) {
+                    Thread.sleep(1000)
+                }
             } catch (_: Exception) {
                 try { socket.close() } catch (_: Exception) {}
             }
-        }.also { it.name = "A01-HTTP-client"; it.start() }
+        }.also {
+            it.name = "A01-HTTP-client"
+            it.start()
+        }
+    }
+
+    private fun writeResponse(
+        output: OutputStream,
+        status: String,
+        contentType: String,
+        body: String,
+        close: Boolean
+    ) {
+        val bytes = body.toByteArray(StandardCharsets.UTF_8)
+        val header = "HTTP/1.0 $status\r\n" +
+            "Content-Type: $contentType\r\n" +
+            "Content-Length: ${bytes.size}\r\n" +
+            "Connection: ${if (close) "close" else "keep-alive"}\r\n\r\n"
+        output.write(header.toByteArray(StandardCharsets.US_ASCII))
+        output.write(bytes)
+        output.flush()
     }
 }
 
-fun localIpv4(): String {
+fun localIpv4(context: Context): String {
+    // Prefer the active Wi-Fi/Ethernet link so the URL advertised to the DLNA box
+    // is not accidentally built from a VPN/cellular interface.
+    try {
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE)
+            as android.net.ConnectivityManager
+        val network = cm.activeNetwork
+        val caps = network?.let(cm::getNetworkCapabilities)
+        if (network != null && caps != null && (
+                caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) ||
+                    caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_ETHERNET)
+                )) {
+            cm.getLinkProperties(network)?.linkAddresses?.forEach { link ->
+                val address = link.address
+                if (address is Inet4Address && !address.isLoopbackAddress) {
+                    return address.hostAddress ?: "127.0.0.1"
+                }
+            }
+        }
+    } catch (_: Exception) {
+    }
+
     return try {
         val interfaces = Collections.list(NetworkInterface.getNetworkInterfaces())
-        for (network in interfaces) {
+        val preferred = interfaces.sortedBy { if (it.name.startsWith("wlan") || it.name.startsWith("eth")) 0 else 1 }
+        for (network in preferred) {
             if (!network.isUp || network.isLoopback) continue
             for (address in Collections.list(network.inetAddresses)) {
-                if (address is Inet4Address && !address.isLoopbackAddress) return address.hostAddress ?: continue
+                if (address is Inet4Address && !address.isLoopbackAddress) {
+                    return address.hostAddress ?: continue
+                }
             }
         }
         "127.0.0.1"
@@ -235,3 +372,11 @@ fun localIpv4(): String {
         "127.0.0.1"
     }
 }
+
+/**
+ * IP HP yang dilihat STB. Memakai soket UDP "connect" ke IP STB (seperti local_ip_for_renderer()
+ * di tar v6) sehingga benar untuk Wi-Fi biasa maupun hotspot HP; kalau gagal baru pakai
+ * pencarian interface biasa.
+ */
+fun localIpv4For(context: Context, remoteHost: String): String =
+    DlnaController.localAddressToward(remoteHost) ?: localIpv4(context)

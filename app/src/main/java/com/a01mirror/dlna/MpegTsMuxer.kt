@@ -83,7 +83,9 @@ class MpegTsMuxer {
         packet[0] = 0x47
         packet[1] = ((pid shr 8) and 0x1F or 0x40).toByte()
         packet[2] = (pid and 0xFF).toByte()
-        packet[3] = 0x10
+        val cc = continuity[pid] ?: 0
+        continuity[pid] = (cc + 1) and 0x0F
+        packet[3] = (0x10 or cc).toByte()
         packet[4] = 0x00 // pointer_field
         val n = min(section.size, TS_SIZE - 5)
         System.arraycopy(section, 0, packet, 5, n)

@@ -29,22 +29,14 @@ class H264Encoder(
 
     fun start() {
         check(!running) { "encoder already running" }
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
-            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            setInteger(MediaFormat.KEY_BIT_RATE, if (width >= 1920) 8_000_000 else 4_500_000)
-            setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-            setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
-        }
-
-        codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-        codec!!.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        codec = createConfiguredCodec()
         inputSurface = codec!!.createInputSurface()
         codec!!.start()
 
         projectionCallback = object : MediaProjection.Callback() {
             override fun onStop() {
                 running = false
+                try { onFailure(IllegalStateException("Screen capture dihentikan oleh sistem.")) } catch (_: Exception) {}
             }
         }
         projection.registerCallback(projectionCallback!!, null)
@@ -62,6 +54,48 @@ class H264Encoder(
 
         running = true
         thread = Thread { drainLoop() }.also { it.name = "A01-H264"; it.start() }
+    }
+
+    private fun buildFormat(strict: Boolean): MediaFormat =
+        MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+            // Tar v6 memakai 2.5-3 Mbps untuk 720p; dongle Wi-Fi STB murahan tidak kuat bitrate besar.
+            setInteger(MediaFormat.KEY_BIT_RATE, if (width >= 1920) 6_000_000 else 3_000_000)
+            setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            // Layar statis tidak menghasilkan frame baru; ulangi frame terakhir agar STB tidak kehabisan data.
+            setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 250_000L)
+            if (strict) {
+                // H.264 Main (ffmpeg -profile:v main di tar v6) + CBR untuk aliran live.
+                setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileMain)
+                setInteger(MediaFormat.KEY_LEVEL, avcLevel())
+                setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
+            }
+        }
+
+    /** Level terendah yang cukup untuk resolusi/fps (720p30 = 3.1 seperti tar v6). */
+    private fun avcLevel(): Int {
+        val mbs = ((width + 15) / 16) * ((height + 15) / 16)
+        val rate = mbs * fps
+        return when {
+            mbs <= 3600 && rate <= 108_000 -> MediaCodecInfo.CodecProfileLevel.AVCLevel31
+            mbs <= 5120 && rate <= 216_000 -> MediaCodecInfo.CodecProfileLevel.AVCLevel32
+            mbs <= 8192 && rate <= 245_760 -> MediaCodecInfo.CodecProfileLevel.AVCLevel4
+            else -> MediaCodecInfo.CodecProfileLevel.AVCLevel42
+        }
+    }
+
+    /** Coba profil Main + CBR dulu; kalau encoder HP menolak, pakai konfigurasi bawaan. */
+    private fun createConfiguredCodec(): MediaCodec {
+        var c = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        try {
+            c.configure(buildFormat(true), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        } catch (_: Exception) {
+            try { c.release() } catch (_: Exception) {}
+            c = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            c.configure(buildFormat(false), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        }
+        return c
     }
 
     fun stop() {
@@ -89,8 +123,8 @@ class H264Encoder(
                     MediaCodec.INFO_TRY_AGAIN_LATER -> Unit
                     MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                         val outFormat = c.outputFormat
-                        val csd0 = outFormat.getByteBuffer("csd-0")
-                        if (csd0 != null) setConfig(csd0)
+                        outFormat.getByteBuffer("csd-0")?.let(::setConfig)
+                        outFormat.getByteBuffer("csd-1")?.let(::setConfig)
                     }
                     else -> if (index >= 0) {
                         val buffer = c.getOutputBuffer(index)
@@ -107,7 +141,8 @@ class H264Encoder(
                                 val annexB = normalizeH264(data)
                                 val isKey = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0 || containsIdr(annexB)
                                 val packet = if (isKey) prefixConfig(annexB) else annexB
-                                broadcaster.publishVideo(packet, info.presentationTimeUs * 90L / 1000L, isKey)
+                                val pts = (info.presentationTimeUs.coerceAtLeast(0L) * 90L / 1000L)
+                                broadcaster.publishVideo(packet, pts, isKey)
                             }
                         }
                         c.releaseOutputBuffer(index, false)
@@ -123,7 +158,27 @@ class H264Encoder(
 
     private fun setConfig(buffer: ByteBuffer) {
         val bytes = ByteArray(buffer.remaining())
+        val originalPosition = buffer.position()
         buffer.get(bytes)
+        try { buffer.position(originalPosition) } catch (_: Exception) {}
+
+        if (bytes.isEmpty()) return
+        if (isAnnexB(bytes)) {
+            for (nal in splitAnnexB(bytes)) {
+                if (nal.isEmpty()) continue
+                when (nal[0].toInt() and 0x1F) {
+                    7 -> sps = nal
+                    8 -> pps = nal
+                }
+            }
+            return
+        }
+
+        when (bytes[0].toInt() and 0x1F) {
+            7 -> { sps = bytes; return }
+            8 -> { pps = bytes; return }
+        }
+
         val pair = extractConfig(bytes)
         if (pair.first != null) sps = pair.first
         if (pair.second != null) pps = pair.second
