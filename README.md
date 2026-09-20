@@ -61,3 +61,14 @@ TAndroidLame is a GPL-3.0 project and uses native code. Verify its license oblig
 - Android MediaProjection: https://developer.android.com/media/grow/media-projection
 - Android playback capture: https://developer.android.com/media/platform/av-capture
 - Android 16 KB page-size guidance: https://developer.android.com/guide/practices/page-sizes
+
+
+## STB tidak ketemu / IP tidak terbaca
+
+- Pencarian SSDP dikirim per-interface (Wi-Fi, hotspot HP, LAN), jadi tetap jalan walau data seluler jadi jaringan default atau Wi-Fi/hotspot tanpa internet.
+- Isi kolom **IP STB** (angka yang tampil di layar STB) lalu tekan **Cari STB DLNA**. Aplikasi mencoba SSDP unicast ke IP itu, lalu menebak alamat deskripsi UPnP di port/path umum. IP terakhir disimpan otomatis.
+- Bila tetap gagal, laporan pencarian (interface yang dipindai, balasan SSDP, port terbuka) tampil di kolom status.
+- IP HP untuk URL stream dihitung ke arah STB (soket UDP `connect`, sama dengan `local_ip_for_renderer()` di `advance01-media-center-v6`), jadi benar untuk Wi-Fi biasa maupun hotspot HP.
+- Format DLNA (DIDL tanpa `DLNA.ORG_PN`, `OP=01` + `FLAGS`, HTTP/1.1 chunked, header `contentFeatures.dlna.org` / `transferMode.dlna.org`, jeda antara `SetAVTransportURI` dan `Play`, Play baru dikirim setelah ada frame video pertama) disamakan dengan `advance01-media-center-v6`. Default video 720p / 25 fps, H.264 Main, audio MPEG-1 Layer III 48 kHz.
+- Tombol **Log DLNA** menampilkan laporan pencarian dan 30 SOAP terakhir (mirip `soap_trace` di tar v6) untuk dikirim saat ada error. Saat STB dipilih, aplikasi langsung menguji `GetTransportInfo` dan `GetProtocolInfo` dan menampilkan hasilnya.
+- Chunk HTTP dipotong per 188×32 byte (kelipatan paket TS), PAT/PMT dikirim tiap 0,25 detik, seperti ffmpeg di tar v6.

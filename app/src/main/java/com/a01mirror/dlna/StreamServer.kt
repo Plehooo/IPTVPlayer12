@@ -23,6 +23,9 @@ import java.util.UUID
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.CopyOnWriteArrayList
 
+/** 188 * 32 byte, sama dengan ukuran baca ffmpeg->TS di tar v6. */
+private const val TS_CHUNK_BYTES = 188 * 32
+
 class TsBroadcaster(
     private val resolver: ContentResolver
 ) {
@@ -33,6 +36,12 @@ class TsBroadcaster(
     private var lastTablesNs = 0L
     private var recordingFailed = false
 
+    /** Byte TS & frame video yang sudah dihasilkan; dipakai menunggu data pertama sebelum Play. */
+    @Volatile var bytesPublished: Long = 0L
+        private set
+    @Volatile var videoFrames: Long = 0L
+        private set
+
     val sessionToken: String = UUID.randomUUID().toString().replace("-", "")
 
     init {
@@ -42,6 +51,7 @@ class TsBroadcaster(
     @Synchronized
     fun publishVideo(accessUnit: ByteArray, pts90k: Long, keyFrame: Boolean) {
         publish(muxer.videoPes(accessUnit, pts90k, keyFrame))
+        videoFrames += 1
     }
 
     @Synchronized
@@ -52,7 +62,8 @@ class TsBroadcaster(
     @Synchronized
     private fun publish(packet: ByteArray) {
         if (packet.isEmpty()) return
-        if (System.nanoTime() - lastTablesNs >= 500_000_000L) {
+        bytesPublished += packet.size
+        if (System.nanoTime() - lastTablesNs >= 250_000_000L) {
             writeRecording(muxer.patPacket())
             writeRecording(muxer.pmtPacket())
             broadcast(muxer.patPacket())
@@ -143,7 +154,7 @@ class TsBroadcaster(
         private val socket: Socket,
         private val output: OutputStream
     ) {
-        private val queue = ArrayBlockingQueue<ByteArray>(32)
+        private val queue = ArrayBlockingQueue<ByteArray>(96)
         @Volatile private var closed = false
         private var writer: Thread? = null
 
@@ -158,7 +169,21 @@ class TsBroadcaster(
                 try {
                     while (!closed) {
                         val packet = queue.take()
-                        output.write(packet)
+                        // HTTP/1.1 chunked seperti send_chunk() di tar v6. Frame video besar dipotong
+                        // per 188*32 byte (kelipatan paket TS) seperti p.stdout.read(188*32) di tar,
+                        // supaya STB dengan buffer kecil tidak tersedak chunk ratusan KB.
+                        var offset = 0
+                        while (offset < packet.size) {
+                            val len = minOf(TS_CHUNK_BYTES, packet.size - offset)
+                            val head = (Integer.toHexString(len) + "\r\n").toByteArray(StandardCharsets.US_ASCII)
+                            val frame = ByteArray(head.size + len + 2)
+                            System.arraycopy(head, 0, frame, 0, head.size)
+                            System.arraycopy(packet, offset, frame, head.size, len)
+                            frame[frame.size - 2] = 13
+                            frame[frame.size - 1] = 10
+                            output.write(frame)
+                            offset += len
+                        }
                         output.flush()
                     }
                 } catch (_: InterruptedException) {
@@ -265,16 +290,17 @@ class LiveHttpServer(
                     return@Thread
                 }
 
-                // The generated transport stream is 188-byte MPEG-TS. video/mpeg is
-                // the DLNA media type associated with the non-192-byte transport format.
+                // Header disamakan dengan begin_stream() di tar v6 (yang jalan di STB):
+                // HTTP/1.1 chunked + contentFeatures/transferMode DLNA yang benar.
                 val header = buildString {
-                    append("HTTP/1.0 200 OK\r\n")
+                    append("HTTP/1.1 200 OK\r\n")
                     append("Content-Type: video/mpeg\r\n")
-                    append("Content-Features.DLNA.ORG: DLNA.ORG_PN=AVC_TS_MP_HD_MPEG1_L3;DLNA.ORG_OP=00;DLNA.ORG_CI=0\r\n")
-                    append("TransferMode.DLNA.ORG: Streaming\r\n")
                     append("Cache-Control: no-cache, no-store, must-revalidate\r\n")
                     append("Pragma: no-cache\r\n")
                     append("Connection: close\r\n")
+                    append("Transfer-Encoding: chunked\r\n")
+                    append("transferMode.dlna.org: Streaming\r\n")
+                    append("contentFeatures.dlna.org: ").append(DlnaController.DLNA_FEATURES).append("\r\n")
                     append("\r\n")
                 }
                 output.write(header.toByteArray(StandardCharsets.US_ASCII))
@@ -356,3 +382,11 @@ fun localIpv4(context: Context): String {
         "127.0.0.1"
     }
 }
+
+/**
+ * IP HP yang dilihat STB. Memakai soket UDP "connect" ke IP STB (seperti local_ip_for_renderer()
+ * di tar v6) sehingga benar untuk Wi-Fi biasa maupun hotspot HP; kalau gagal baru pakai
+ * pencarian interface biasa.
+ */
+fun localIpv4For(context: Context, remoteHost: String): String =
+    DlnaController.localAddressToward(remoteHost) ?: localIpv4(context)
