@@ -3,6 +3,7 @@ package com.a01mirror.dlna
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioRecord
+import android.media.AudioTimestamp
 import android.media.MediaRecorder
 import android.media.projection.MediaProjection
 import android.os.Process
@@ -50,7 +51,7 @@ class AudioCapture(
 
                     ar = AudioRecord.Builder()
                         .setAudioFormat(format)
-                        .setBufferSizeInBytes((minBuffer * 2).coerceAtLeast(minBuffer))
+                        .setBufferSizeInBytes((minBuffer * 4).coerceAtLeast(minBuffer))
                         .setAudioPlaybackCaptureConfig(config)
                         .build()
                     selectedRate = rate
@@ -109,10 +110,11 @@ class AudioCapture(
     private fun loop() {
         val rec = record ?: return
         val enc = lame ?: return
-        // Satu frame MP3 (1152 sampel ~ 24 ms pada 48 kHz) per pembacaan, agar audio tidak menambah latency.
+        // Dua frame MP3 (2304 sampel/channel) ≈ 48 ms pada 48 kHz.
+        // Batch ini menjaga encoder/network tetap irit wake-up tanpa membuat audio menunggu ratusan ms.
         val framesPerRead = 1152
         val pcm = ShortArray(framesPerRead * channels)
-        val mp3 = ByteArray(7200 + pcm.size * 2)
+        val mp3 = ByteArray(12_288 + pcm.size * 2)
         var samplesPerChannel = 0L
         var lastPts90k = 0L
 
@@ -120,28 +122,60 @@ class AudioCapture(
             // Audio tidak boleh tersendat walau game/aplikasi berat sedang memakai CPU.
             try { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO) } catch (_: Throwable) {}
             rec.startRecording()
-            // Jangkar waktu bersama dengan video (jam broadcaster) supaya lip-sync tidak bergeser.
-            val anchor90k = (System.nanoTime() - broadcaster.clockOriginNs).coerceAtLeast(0L) * 9L / 100_000L
+
+            // AudioTimestamp memakai TIMEBASE_MONOTONIC, yaitu jam yang sama dengan System.nanoTime().
+            // Dari sini kita hitung posisi frame-0 secara akurat, sehingga PTS audio tidak drift terhadap video.
+            val audioTimestamp = AudioTimestamp()
+            var audioOriginNs = System.nanoTime()
+            if (rec.getTimestamp(audioTimestamp, AudioTimestamp.TIMEBASE_MONOTONIC) == AudioRecord.SUCCESS &&
+                audioTimestamp.framePosition >= 0L
+            ) {
+                audioOriginNs = audioTimestamp.nanoTime -
+                    (audioTimestamp.framePosition * 1_000_000_000L / sampleRate)
+            }
+            var lastTimestampCheckNs = System.nanoTime()
+            var anchor90k = (audioOriginNs - broadcaster.clockOriginNs).coerceAtLeast(0L) * 90_000L / 1_000_000_000L
+
             while (running) {
                 val shorts = rec.read(pcm, 0, pcm.size, AudioRecord.READ_BLOCKING)
                 if (shorts < 0) throw IllegalStateException("AudioRecord.read gagal ($shorts)")
                 if (shorts == 0) {
-                    Thread.sleep(5)
+                    Thread.sleep(3)
                     continue
                 }
                 val perChannel = shorts / channels
                 val encoded = enc.encodeBufferInterLeaved(pcm, perChannel, mp3)
+
+                // Koreksi clock kira-kira 4× per detik. Jangan koreksi setiap frame karena itu bisa
+                // membuat PTS loncat-loncat dan terdengar seperti audio patah.
+                val nowNs = System.nanoTime()
+                if (nowNs - lastTimestampCheckNs >= 250_000_000L &&
+                    rec.getTimestamp(audioTimestamp, AudioTimestamp.TIMEBASE_MONOTONIC) == AudioRecord.SUCCESS &&
+                    audioTimestamp.framePosition >= 0L
+                ) {
+                    val candidateOriginNs = audioTimestamp.nanoTime -
+                        (audioTimestamp.framePosition * 1_000_000_000L / sampleRate)
+                    // Koreksi perlahan; maksimal 2 ms per update agar tidak menghasilkan timestamp spike.
+                    val currentOrigin = audioOriginNs
+                    val correction = (candidateOriginNs - currentOrigin).coerceIn(-500_000L, 500_000L)
+                    audioOriginNs = currentOrigin + correction
+                    anchor90k = (audioOriginNs - broadcaster.clockOriginNs).coerceAtLeast(0L) * 90_000L / 1_000_000_000L
+                    lastTimestampCheckNs = nowNs
+                }
+
                 if (encoded > 0) {
                     val bytes = mp3.copyOf(encoded)
-                    val pts = anchor90k + samplesPerChannel * 90000L / sampleRate
-                    broadcaster.publishAudio(bytes, pts)
-                    lastPts90k = pts
+                    val pts = anchor90k + samplesPerChannel * 90_000L / sampleRate
+                    val safePts = maxOf(pts, lastPts90k + if (lastPts90k > 0L) 1L else 0L)
+                    broadcaster.publishAudio(bytes, safePts)
+                    lastPts90k = safePts
                 }
                 samplesPerChannel += perChannel
             }
             val flushed = enc.flush(mp3)
             if (flushed > 0) {
-                broadcaster.publishAudio(mp3.copyOf(flushed), anchor90k + samplesPerChannel * 90000L / sampleRate)
+                val pts = anchor90k + samplesPerChannel * 90_000L / sampleRate
+                broadcaster.publishAudio(mp3.copyOf(flushed), maxOf(pts, lastPts90k + 1L))
             }
         } catch (t: Throwable) {
             if (running) {

@@ -27,16 +27,20 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 
-private const val TS_CHUNK_BYTES = 188 * 32
+private const val TS_CHUNK_BYTES = 188 * 7
+private const val TS_FLUSH_BYTES = TS_CHUNK_BYTES
 
 // Antrean per klien: cukup dalam supaya lonjakan Wi-Fi / CPU (game berat) tidak langsung memutus stream.
-private const val CLIENT_QUEUE_CAPACITY = 48
+private const val CLIENT_VIDEO_QUEUE_CAPACITY = 24
+private const val CLIENT_AUDIO_QUEUE_CAPACITY = 48
+private const val CLIENT_TABLE_QUEUE_CAPACITY = 8
 // Keep the renderer close to the live edge. A long queue is what turns a short CPU/Wi-Fi hiccup
 // into several seconds of perceived delay on cheap DLNA firmware.
-private const val MAX_CLIENT_VIDEO_AGE_NS = 350_000_000L
-private const val MAX_CLIENT_AUDIO_AGE_NS = 550_000_000L
-private const val LIVE_PACE_MULTIPLIER = 1.15
-private const val MAX_AUDIO_BEHIND_VIDEO_90K = 16_200L // 180 ms
+private const val MAX_CLIENT_VIDEO_AGE_NS = 300_000_000L
+private const val MAX_CLIENT_AUDIO_AGE_NS = 500_000_000L
+private const val LIVE_PACE_MULTIPLIER = 1.03
+private const val MAX_AUDIO_BEHIND_VIDEO_90K = 27_000L // 300 ms
+private const val RESYNC_AUDIO_MAX_ITEMS = 10 // ~240 ms @ 48 kHz / 1152 sampel per MP3 frame
 
 // Rekaman: antrean besar (dibatasi memori) dan tidak pernah mati permanen karena disk sesaat lambat.
 private const val RECORD_QUEUE_MAX_BYTES = 16L * 1024L * 1024L
@@ -52,7 +56,11 @@ class TsBroadcaster(
     private val resolver: ContentResolver,
     private val enableRecording: Boolean = true
 ) {
-    private val muxer = MpegTsMuxer()
+    // Satu muxer per kelompok PID: tidak ada lock silang antara muxing video besar, audio kecil,
+    // dan PAT/PMT. Continuity counter memang bersifat per-PID, jadi pemisahan ini tetap valid.
+    private val videoMuxer = MpegTsMuxer()
+    private val audioMuxer = MpegTsMuxer()
+    private val tableMuxer = MpegTsMuxer()
     private val clients = CopyOnWriteArrayList<Client>()
     @Volatile private var output: OutputStream? = null
     private var pendingUri = android.net.Uri.EMPTY
@@ -91,6 +99,8 @@ class TsBroadcaster(
     @Volatile var droppedVideoFrames: Long = 0L
         private set
     @Volatile var droppedClientPackets: Long = 0L
+        private set
+    @Volatile var droppedClientAudioPackets: Long = 0L
         private set
 
     val clientCount: Int get() = clients.size
@@ -134,23 +144,30 @@ class TsBroadcaster(
         else -> "aktif"
     }
 
-    @Synchronized
     fun publishVideo(accessUnit: ByteArray, pts90k: Long, keyFrame: Boolean) {
-        val packet = muxer.videoPes(accessUnit, pts90k, keyFrame)
-        if (keyFrame) {
-            latestKeyFrameTs = packet
-            latestKeyFramePts90k = pts90k
-            pFramesSinceKey = 0
-        } else {
-            pFramesSinceKey++
+        // Muxing dilakukan di luar lock publisher. Lock hanya dipakai saat memasukkan access-unit
+        // ke jalur live/recording, sehingga thread audio tidak ikut menunggu pembuatan IDR besar.
+        val packet = videoMuxer.videoPes(accessUnit, pts90k, keyFrame)
+        synchronized(this) {
+            if (keyFrame) {
+                latestKeyFrameTs = packet
+                latestKeyFramePts90k = pts90k
+                pFramesSinceKey = 0
+            } else {
+                pFramesSinceKey++
+            }
+            publish(packet, KIND_VIDEO, keyFrame, pts90k)
+            videoFrames += 1
         }
-        publish(packet, KIND_VIDEO, keyFrame, pts90k)
-        videoFrames += 1
     }
 
-    @Synchronized
     fun publishAudio(mp3: ByteArray, pts90k: Long) {
-        if (mp3.isNotEmpty()) publish(muxer.audioPes(mp3, pts90k), KIND_AUDIO, false, pts90k)
+        if (mp3.isEmpty()) return
+        // Separate audio muxer menghindari contention dengan access-unit video yang bisa besar.
+        val packet = audioMuxer.audioPes(mp3, pts90k)
+        synchronized(this) {
+            publish(packet, KIND_AUDIO, false, pts90k)
+        }
     }
 
     @Synchronized
@@ -162,8 +179,8 @@ class TsBroadcaster(
         val isKeyVideo = kind == KIND_VIDEO && keyFrame
         // PAT/PMT tiap 250 ms dan selalu tepat sebelum IDR (titik masuk klien baru & rekaman).
         if (isKeyVideo || now - lastTablesNs >= 250_000_000L) {
-            val pat = muxer.patPacket()
-            val pmt = muxer.pmtPacket()
+            val pat = tableMuxer.patPacket()
+            val pmt = tableMuxer.pmtPacket()
             latestPat = pat
             latestPmt = pmt
             writeRecording(pat)
@@ -263,7 +280,7 @@ class TsBroadcaster(
         try {
             socket.tcpNoDelay = true
             socket.keepAlive = true
-            socket.sendBufferSize = 64 * 1024
+            socket.sendBufferSize = 128 * 1024
             socket.receiveBufferSize = 16 * 1024
         } catch (_: Exception) {}
         try { socket.trafficClass = 0x10 } catch (_: Exception) {}
@@ -273,6 +290,7 @@ class TsBroadcaster(
             outputStream,
             { targetVideoBitrate + TARGET_AUDIO_BITRATE },
             { droppedClientPackets += 1L },
+            { droppedClientAudioPackets += 1L },
             { requestKeyFrame() },
             chunked
         )
@@ -280,8 +298,8 @@ class TsBroadcaster(
             // Tidak ada penulisan socket di sini (dulu memblokir lock broadcaster dan menahan encoder).
             // IDR tersimpan hanya dipakai bila belum ada frame P sesudahnya; kalau sudah ada, klien
             // menunggu IDR baru (diminta ke encoder) supaya tidak ada artefak referensi hilang.
-            val pat = latestPat ?: muxer.patPacket()
-            val pmt = latestPmt ?: muxer.pmtPacket()
+            val pat = latestPat ?: tableMuxer.patPacket()
+            val pmt = latestPmt ?: tableMuxer.pmtPacket()
             val cached = latestKeyFrameTs
             val warm = cached != null && pFramesSinceKey == 0
             client.prime(pat, pmt, if (warm) cached else null, latestKeyFramePts90k)
@@ -365,7 +383,8 @@ class TsBroadcaster(
         private val socket: Socket,
         outputStream: OutputStream,
         private val bitrateProvider: () -> Long,
-        private val onDrop: () -> Unit,
+        private val onDropVideo: () -> Unit,
+        private val onDropAudio: () -> Unit,
         private val onNeedKey: () -> Unit,
         private val chunked: Boolean = true
     ) {
@@ -379,20 +398,34 @@ class TsBroadcaster(
             val enqueuedNs: Long
         )
 
-        private val queue = ArrayBlockingQueue<QueuedPacket>(CLIENT_QUEUE_CAPACITY)
+        /*
+         * Video dan audio sengaja punya antrean terpisah. Satu access-unit IDR bisa ratusan KB;
+         * bila FIFO tunggal dipakai, audio dapat terjebak di belakang IDR dan terdengar patah.
+         * Writer mengambil unit 7 TS (1316 byte) bergantian berdasarkan PTS, sehingga audio dapat
+         * menyisip di tengah IDR tanpa mengubah struktur MPEG-TS.
+         */
+        private val videoQueue = ArrayBlockingQueue<QueuedPacket>(CLIENT_VIDEO_QUEUE_CAPACITY)
+        private val audioQueue = ArrayBlockingQueue<QueuedPacket>(CLIENT_AUDIO_QUEUE_CAPACITY)
+        private val tableQueue = ArrayBlockingQueue<QueuedPacket>(CLIENT_TABLE_QUEUE_CAPACITY)
+
         @Volatile private var closed = false
         @Volatile private var waitingForKey = false
         private var writer: Thread? = null
         private var nextWireNs = 0L
         private var lastVideoPts90k = -1L
+        private var currentVideo: QueuedPacket? = null
+        private var currentAudio: QueuedPacket? = null
+        private var currentVideoOffset = 0
+        private var currentAudioOffset = 0
+        private var pendingFlushBytes = 0
 
         /** Isi awal (tanpa menulis ke socket): PAT/PMT, plus IDR bila masih segar. */
         fun prime(pat: ByteArray, pmt: ByteArray, keyFrame: ByteArray?, keyPts90k: Long) {
             val now = System.nanoTime()
-            queue.offer(QueuedPacket(pat, KIND_TABLE, false, -1L, now))
-            queue.offer(QueuedPacket(pmt, KIND_TABLE, false, -1L, now))
+            tableQueue.offer(QueuedPacket(pat, KIND_TABLE, false, -1L, now))
+            tableQueue.offer(QueuedPacket(pmt, KIND_TABLE, false, -1L, now))
             if (keyFrame != null) {
-                queue.offer(QueuedPacket(keyFrame, KIND_VIDEO, true, keyPts90k, now))
+                videoQueue.offer(QueuedPacket(keyFrame, KIND_VIDEO, true, keyPts90k, now))
                 lastVideoPts90k = keyPts90k
             } else {
                 waitingForKey = true
@@ -405,107 +438,144 @@ class TsBroadcaster(
 
             if (waitingForKey) {
                 when {
-                    kind == KIND_TABLE -> Unit
+                    kind == KIND_TABLE -> return tableQueue.offer(
+                        QueuedPacket(bytes, kind, keyFrame, pts90k, System.nanoTime())
+                    )
                     keyFrame -> {
                         waitingForKey = false
+                        // Jangan buang antrean audio: audio yang sudah direkam sebelum IDR baru masih
+                        // lebih berguna daripada membuat silence gap. Packet audio yang terlalu tua tetap
+                        // dibuang oleh age/PTS guard di writer.
+                        videoQueue.clear()
+                        currentVideo = null
+                        currentVideoOffset = 0
                         lastVideoPts90k = pts90k
                     }
-                    else -> return true // Saat resync, buang A/V lama dan tunggu satu IDR baru.
+                    kind == KIND_AUDIO -> {
+                        while (audioQueue.size >= RESYNC_AUDIO_MAX_ITEMS) {
+                            audioQueue.poll()
+                            onDropAudio()
+                        }
+                        audioQueue.offer(QueuedPacket(bytes, kind, keyFrame, pts90k, System.nanoTime()))
+                        return true
+                    }
+                    else -> return true // Saat resync, buang video P dan tunggu satu IDR baru.
                 }
             }
 
-            // Jangan masukkan paket audio yang timestamp-nya sudah jauh tertinggal dari video live.
-            // Ini mencegah renderer memainkan potongan audio lama setelah gambar sudah maju.
             if (kind == KIND_AUDIO && lastVideoPts90k >= 0L && pts90k >= 0L &&
-                pts90k + MAX_AUDIO_BEHIND_VIDEO_90K < lastVideoPts90k) {
-                onDrop()
+                pts90k + MAX_AUDIO_BEHIND_VIDEO_90K < lastVideoPts90k
+            ) {
+                onDropAudio()
                 return true
             }
+
             if (kind == KIND_VIDEO && pts90k >= 0L) {
                 if (!keyFrame && lastVideoPts90k >= 0L && pts90k + 4_500L < lastVideoPts90k) {
-                    onDrop()
+                    onDropVideo()
                     return true
                 }
                 lastVideoPts90k = pts90k
             }
 
             val item = QueuedPacket(bytes, kind, keyFrame, pts90k, System.nanoTime())
-            if (queue.offer(item)) return true
-
-            // Antrean penuh = klien tak sanggup mengikuti arus. Utamakan live-edge daripada
-            // menyimpan backlog beberapa detik. Audio lama juga dibuang ketika kita melakukan resync.
-            onDrop()
-            if (keyFrame) {
-                removeNonTables()
-                if (!queue.offer(item)) {
-                    removeOldestAudioOrTable()
-                    queue.offer(item)
+            return when (kind) {
+                KIND_TABLE -> {
+                    // PAT/PMT dikirim berulang. Bila slot tabel sedang penuh, cukup buang tabel ini;
+                    // jangan memutus klien yang masih memiliki video/audio yang valid.
+                    tableQueue.offer(item)
+                    true
                 }
-                waitingForKey = false
-                return true
+                KIND_VIDEO -> {
+                    if (videoQueue.offer(item)) {
+                        true
+                    } else if (keyFrame) {
+                        // IDR harus selalu mendapat slot: buang backlog video dan masuk live-edge; audio segar dipertahankan.
+                        videoQueue.clear()
+                        currentVideo = null
+                        currentVideoOffset = 0
+                        videoQueue.offer(item).also { accepted ->
+                            onDropVideo()
+                            if (!accepted) {
+                                waitingForKey = true
+                                onNeedKey()
+                            }
+                        }
+                    } else {
+                        waitingForKey = true
+                        videoQueue.clear()
+                        currentVideo = null
+                        currentVideoOffset = 0
+                        currentAudio = null
+                        currentAudioOffset = 0
+                        while (audioQueue.size > RESYNC_AUDIO_MAX_ITEMS) {
+                            audioQueue.poll()
+                            onDropAudio()
+                        }
+                        onDropVideo()
+                        onNeedKey()
+                        true
+                    }
+                }
+                KIND_AUDIO -> {
+                    if (audioQueue.offer(item)) {
+                        true
+                    } else {
+                        // Audio loss tidak boleh memicu penurunan bitrate video.
+                        audioQueue.poll()
+                        onDropAudio()
+                        audioQueue.offer(item)
+                    }
+                }
+                else -> true
             }
-            if (kind == KIND_VIDEO) {
-                waitingForKey = true
-                queue.clear()
-                onNeedKey()
-                return true
-            }
-            // Untuk audio, buang audio tertua. Jika ternyata tabel memenuhi antrean, buang item
-            // tertua non-video sebagai pilihan terakhir agar video tidak ikut tersingkir.
-            removeOldestAudioOrTable()
-            queue.offer(item)
-            return true
-        }
-
-        private fun removeNonTables() {
-            for (old in queue.toList()) {
-                if (old.kind != KIND_TABLE) queue.remove(old)
-            }
-        }
-
-        private fun removeOldestAudioOrTable() {
-            for (old in queue.toList()) {
-                if (old.kind == KIND_AUDIO && queue.remove(old)) return
-            }
-            for (old in queue.toList()) {
-                if (old.kind == KIND_TABLE && queue.remove(old)) return
-            }
-            queue.poll()
         }
 
         fun resetForRecovery() {
             waitingForKey = true
-            queue.clear()
+            videoQueue.clear()
+            tableQueue.clear()
+            currentVideo = null
+            currentVideoOffset = 0
+            while (audioQueue.size > RESYNC_AUDIO_MAX_ITEMS) {
+                audioQueue.poll()
+                onDropAudio()
+            }
+            currentAudio = null
+            currentAudioOffset = 0
             nextWireNs = 0L
             lastVideoPts90k = -1L
+            pendingFlushBytes = 0
         }
 
         fun start() {
             writer = Thread {
                 try {
+                    // Network writer jangan memakai DISPLAY priority; itu bisa merebut waktu CPU/UI
+                    // dari game/browser yang sedang dibuka user.
                     Process.setThreadPriority(Process.THREAD_PRIORITY_DEFAULT)
                 } catch (_: Throwable) {}
 
                 try {
                     while (!closed) {
-                        val queued = queue.take()
-                        val age = System.nanoTime() - queued.enqueuedNs
-
-                        if (queued.kind == KIND_VIDEO && !queued.keyFrame && age > MAX_CLIENT_VIDEO_AGE_NS) {
-                            // Terlalu jauh tertinggal: resync bersih di IDR berikutnya.
-                            onDrop()
-                            waitingForKey = true
-                            queue.clear()
-                            onNeedKey()
-                            continue
+                        if (waitingForKey) {
+                            // Tahan audio yang sudah ter-buffer sampai IDR baru masuk; ini menghindari
+                            // silence gap yang panjang ketika video harus resync.
+                            currentVideo = null
+                            currentVideoOffset = 0
+                            currentAudio = null
+                            currentAudioOffset = 0
                         }
-                        if (queued.kind == KIND_AUDIO && age > MAX_CLIENT_AUDIO_AGE_NS) continue
-                        if (queued.kind == KIND_AUDIO && queued.pts90k >= 0L && lastVideoPts90k >= 0L &&
-                            queued.pts90k + MAX_AUDIO_BEHIND_VIDEO_90K < lastVideoPts90k) continue
 
-                        // Selalu keluarkan TS dengan pace real-time. Sebelumnya jalur "queue kosong"
-                        // mengirim satu access-unit sekaligus sehingga jaringan/STB menerima burst besar.
-                        paceAndWrite(queued.data)
+                        val wrote = writeOneSmoothChunk()
+                        if (!wrote) {
+                            // Tunggu singkat, tetapi jangan sleep 30-50 ms karena akan terasa sebagai audio gap.
+                            if (tableQueue.isEmpty() && videoQueue.isEmpty() && audioQueue.isEmpty()) {
+                                Thread.sleep(2)
+                            } else {
+                                Thread.yield()
+                            }
+                        }
                     }
                 } catch (_: InterruptedException) {
                     Thread.currentThread().interrupt()
@@ -518,50 +588,158 @@ class TsBroadcaster(
             }
         }
 
-        private fun paceAndWrite(packet: ByteArray) {
-            var offset = 0
-            // Smooth output slightly faster than the encoder's average bitrate instead of a bursty
-            // burst. This keeps the STB's input buffer from oscillating and reduces A/V jitter.
+        private fun writeOneSmoothChunk(): Boolean {
+            // Tabel selalu didahulukan, seperti flush_headers pada ffmpeg tar v6.
+            val table = tableQueue.poll()
+            if (table != null) {
+                val age = System.nanoTime() - table.enqueuedNs
+                if (age <= 1_000_000_000L) {
+                    writeRawChunk(table.data, 0, table.data.size)
+                    flushIfNeeded(force = true)
+                    return true
+                }
+            }
+
+            ensureActivePackets()
+            if (currentVideo == null && currentAudio == null) return false
+
+            val chooseAudio = when {
+                currentVideo == null -> true
+                currentAudio == null -> false
+                else -> currentAudio!!.pts90k <= currentVideo!!.pts90k + 2_250L // ≈25 ms
+            }
+
+            val packet: QueuedPacket
+            val offset: Int
+            if (chooseAudio) {
+                packet = currentAudio ?: return false
+                offset = currentAudioOffset
+            } else {
+                packet = currentVideo ?: return false
+                offset = currentVideoOffset
+            }
+
+            val age = System.nanoTime() - packet.enqueuedNs
+            if (packet.kind == KIND_VIDEO && packet.keyFrame && age > 600_000_000L) {
+                // Jangan pernah mengirim IDR yang sudah tua dengan burst untuk mengejar live edge.
+                // Lebih baik minta IDR baru dan tetap menjaga audio yang masih segar.
+                onDropVideo()
+                waitingForKey = true
+                videoQueue.clear()
+                currentVideo = null
+                currentVideoOffset = 0
+                while (audioQueue.size > RESYNC_AUDIO_MAX_ITEMS) {
+                    audioQueue.poll()
+                    onDropAudio()
+                }
+                onNeedKey()
+                return true
+            }
+            if (packet.kind == KIND_VIDEO && !packet.keyFrame && age > MAX_CLIENT_VIDEO_AGE_NS) {
+                onDropVideo()
+                waitingForKey = true
+                videoQueue.clear()
+                currentVideo = null
+                currentVideoOffset = 0
+                while (audioQueue.size > RESYNC_AUDIO_MAX_ITEMS) {
+                    audioQueue.poll()
+                    onDropAudio()
+                }
+                onNeedKey()
+                return true
+            }
+            if (packet.kind == KIND_AUDIO && age > MAX_CLIENT_AUDIO_AGE_NS) {
+                onDropAudio()
+                currentAudio = null
+                currentAudioOffset = 0
+                return true
+            }
+            if (packet.kind == KIND_AUDIO && packet.pts90k >= 0L && lastVideoPts90k >= 0L &&
+                packet.pts90k + MAX_AUDIO_BEHIND_VIDEO_90K < lastVideoPts90k
+            ) {
+                onDropAudio()
+                currentAudio = null
+                currentAudioOffset = 0
+                return true
+            }
+
+            val len = minOf(TS_CHUNK_BYTES, packet.data.size - offset)
+            if (len <= 0) {
+                if (packet === currentVideo) {
+                    currentVideo = null
+                    currentVideoOffset = 0
+                } else if (packet === currentAudio) {
+                    currentAudio = null
+                    currentAudioOffset = 0
+                }
+                return true
+            }
+
+            paceAndWriteChunk(packet.data, offset, len)
+            if (packet === currentVideo) {
+                currentVideoOffset += len
+                if (currentVideoOffset >= packet.data.size) {
+                    currentVideo = null
+                    currentVideoOffset = 0
+                }
+            } else {
+                currentAudioOffset += len
+                if (currentAudioOffset >= packet.data.size) {
+                    currentAudio = null
+                    currentAudioOffset = 0
+                }
+            }
+            return true
+        }
+
+        private fun ensureActivePackets() {
+            if (currentVideo == null) {
+                currentVideo = videoQueue.poll()
+                currentVideoOffset = 0
+            }
+            if (currentAudio == null) {
+                currentAudio = audioQueue.poll()
+                currentAudioOffset = 0
+            }
+        }
+
+        private fun paceAndWriteChunk(packet: ByteArray, offset: Int, len: Int) {
             val rateBytesPerSec = (bitrateProvider().coerceAtLeast(700_000L) * LIVE_PACE_MULTIPLIER / 8.0)
                 .toLong().coerceAtLeast(1L)
-            var schedule = maxOf(nextWireNs, System.nanoTime())
-            while (offset < packet.size && !closed) {
-                val len = minOf(TS_CHUNK_BYTES, packet.size - offset)
-                val durationNs = (len.toDouble() * 1_000_000_000.0 / rateBytesPerSec).toLong().coerceAtLeast(100_000L)
-                val now = System.nanoTime()
-                val waitNs = schedule - now
-                if (waitNs > 0) sleepNanos(waitNs)
-                writeChunked(packet, offset, len)
-                schedule += durationNs
-                offset += len
+            var now = System.nanoTime()
+            // Bila writer sempat tertahan, jangan mengejar backlog dengan burst. Reset jadwal ke
+            // waktu sekarang setelah >8 ms terlambat, lalu kembali ke jarak wire normal.
+            if (nextWireNs == 0L || nextWireNs < now - 8_000_000L) nextWireNs = now
+            val waitNs = nextWireNs - now
+            if (waitNs > 0L) sleepNanos(waitNs)
+            writeRawChunk(packet, offset, len)
+            now = System.nanoTime()
+            val durationNs = (len.toDouble() * 1_000_000_000.0 / rateBytesPerSec)
+                .toLong().coerceAtLeast(100_000L)
+            nextWireNs = maxOf(nextWireNs + durationNs, now)
+            pendingFlushBytes += len
+            flushIfNeeded(force = false)
+        }
+
+        private fun flushIfNeeded(force: Boolean) {
+            if (force || pendingFlushBytes >= TS_FLUSH_BYTES) {
+                output.flush()
+                pendingFlushBytes = 0
             }
-            output.flush()
-            nextWireNs = maxOf(schedule, System.nanoTime())
         }
 
         private fun sleepNanos(ns: Long) {
             try {
                 val ms = ns / 1_000_000L
                 val nano = (ns % 1_000_000L).toInt()
-                if (ms > 0 || nano > 0) Thread.sleep(ms, nano)
+                if (ms > 0L || nano > 0) Thread.sleep(ms, nano)
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
             }
         }
 
-        private fun writeChunked(packet: ByteArray) {
-            var offset = 0
-            while (offset < packet.size && !closed) {
-                val len = minOf(TS_CHUNK_BYTES, packet.size - offset)
-                writeChunked(packet, offset, len)
-                offset += len
-            }
-            output.flush()
-        }
-
-        private fun writeChunked(packet: ByteArray, offset: Int, len: Int) {
+        private fun writeRawChunk(packet: ByteArray, offset: Int, len: Int) {
             if (!chunked) {
-                // Renderer HTTP/1.0: aliran mentah tanpa framing chunked.
                 output.write(packet, offset, len)
                 return
             }
@@ -575,11 +753,17 @@ class TsBroadcaster(
             if (closed) return
             closed = true
             try { writer?.interrupt() } catch (_: Exception) {}
+            try { output.flush() } catch (_: Exception) {}
             try { output.close() } catch (_: Exception) {}
             try { socket.close() } catch (_: Exception) {}
-            queue.clear()
+            videoQueue.clear()
+            audioQueue.clear()
+            tableQueue.clear()
+            currentVideo = null
+            currentAudio = null
         }
     }
+
 }
 
 class LiveHttpServer(

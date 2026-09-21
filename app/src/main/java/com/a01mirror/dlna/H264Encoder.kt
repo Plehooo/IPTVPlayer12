@@ -81,9 +81,10 @@ class H264Encoder(
             val perfClass = if (Build.VERSION.SDK_INT >= 31) Build.VERSION.MEDIA_PERFORMANCE_CLASS else 0
             return when {
                 lowRam || ramGb < 2.2 -> intArrayOf(848, 480, 25)
-                // Profil otomatis lebih konservatif pada HP menengah: 540p menjaga headroom
-                // saat user membuka YouTube/game/browser bersamaan dengan encoder hardware.
-                ramGb < 4.0 || cores < 8 -> intArrayOf(960, 540, 25)
+                // 720p25 tetap jadi target otomatis untuk perangkat menengah yang cukup kuat;
+                // hardware encoder dipakai lewat Surface sehingga kualitas layar tidak perlu jatuh ke 540p
+                // hanya karena jumlah core < 8. Perangkat low-RAM tetap 480p.
+                ramGb < 4.0 || cores < 6 -> intArrayOf(960, 540, 25)
                 perfClass >= 31 || (ramGb >= 6.0 && cores >= 8) -> intArrayOf(1280, 720, 25)
                 else -> intArrayOf(960, 540, 25)
             }
@@ -186,7 +187,7 @@ class H264Encoder(
         running = true
         thread = Thread {
             // Thread encoder diberi prioritas tinggi supaya frame tetap mengalir saat aplikasi berat berjalan.
-            try { Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY) } catch (_: Throwable) {}
+            try { Process.setThreadPriority(Process.THREAD_PRIORITY_MORE_FAVORABLE) } catch (_: Throwable) {}
             drainLoop()
         }.also {
             it.name = "A01-H264"
@@ -203,21 +204,22 @@ class H264Encoder(
             // Conservative live bitrates keep inexpensive Wi-Fi/DLNA renderers close to the live edge.
             // Quality is still high enough for UI/text at 720p while leaving headroom for audio + jitter.
             val bitrate = when {
-                width >= 1920 && fps >= 60 -> 4_000_000
-                width >= 1920 -> 3_200_000
-                width >= 1280 && fps >= 30 -> 1_900_000
-                width >= 1280 -> 1_650_000
-                width >= 960 -> 1_350_000
-                width >= 848 -> 1_150_000
-                else -> 900_000
+                width >= 1920 && fps >= 60 -> 5_500_000
+                width >= 1920 -> 4_200_000
+                width >= 1280 && fps >= 30 -> 2_700_000
+                width >= 1280 -> 2_500_000
+                width >= 960 -> 1_800_000
+                width >= 848 -> 1_450_000
+                width >= 640 -> 1_050_000
+                else -> 750_000
             }.coerceAtMost(maxBitrate).coerceAtLeast(700_000)
             baseBitrate = bitrate
             currentBitrate = bitrate
             broadcaster.setTargetVideoBitrate(bitrate)
             setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-            setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 250_000L)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+            setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 200_000L)
             if (strict) {
                 setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
                 setInteger(MediaFormat.KEY_PRIORITY, 0)
@@ -445,8 +447,15 @@ class H264Encoder(
 
     private fun maybeAdaptBitrate(c: MediaCodec, lagUs: Long, nowNs: Long, networkPressure: Boolean) {
         val tooLate = lateStreak >= 3 || lagUs >= 300_000L || networkPressure
-        if (tooLate && nowNs - lastBitrateChangeNs > 1_500_000_000L) {
-            val next = (currentBitrate * 0.75).toInt().coerceAtLeast(900_000)
+        if (tooLate && nowNs - lastBitrateChangeNs > 1_200_000_000L) {
+            val floor = when {
+                width >= 1920 -> 1_900_000
+                width >= 1280 -> 1_450_000
+                width >= 960 -> 1_050_000
+                width >= 848 -> 900_000
+                else -> 700_000
+            }
+            val next = (currentBitrate * 0.82).toInt().coerceAtLeast(floor)
             if (next < currentBitrate) {
                 try {
                     c.setParameters(Bundle().apply {
@@ -465,8 +474,8 @@ class H264Encoder(
 
         if (currentBitrate < baseBitrate &&
             healthySinceNs != Long.MIN_VALUE &&
-            nowNs - healthySinceNs > 5_000_000_000L &&
-            nowNs - lastBitrateChangeNs > 5_000_000_000L
+            nowNs - healthySinceNs > 4_000_000_000L &&
+            nowNs - lastBitrateChangeNs > 4_000_000_000L
         ) {
             val next = minOf(baseBitrate, (currentBitrate * 1.20).toInt())
             try {

@@ -3,7 +3,6 @@ package com.a01mirror.dlna
 import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
-import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 
 /** Lightweight M3U playlist model/parser. Keeps the main DLNA/mirroring pipeline independent. */
@@ -16,6 +15,7 @@ data class PlaylistItem(
 
 object PlaylistStore {
     private const val PREFS = "a01mirror"
+    private const val MAX_ITEMS = 5000
     private const val KEY_URL = "playlist_url"
     private const val KEY_ITEMS = "playlist_items"
 
@@ -31,7 +31,7 @@ object PlaylistStore {
 
     fun saveItems(context: Context, items: List<PlaylistItem>) {
         val array = JSONArray()
-        items.take(2000).forEach { item ->
+        items.take(MAX_ITEMS).forEach { item ->
             array.put(JSONObject().apply {
                 put("name", item.name)
                 put("url", item.url)
@@ -49,7 +49,7 @@ object PlaylistStore {
             .getString(KEY_ITEMS, null) ?: return emptyList()
         return try {
             val array = JSONArray(raw)
-            buildList(minOf(array.length(), 2000)) {
+            buildList(minOf(array.length(), MAX_ITEMS)) {
                 for (i in 0 until array.length()) {
                     val o = array.optJSONObject(i) ?: continue
                     val name = o.optString("name").trim()
@@ -74,15 +74,34 @@ object PlaylistStore {
             .map { it.trim().trimStart('\uFEFF') }
             .filter { it.isNotEmpty() }
             .toList()
-        val out = ArrayList<PlaylistItem>(minOf(lines.size / 2, 2000))
+        val out = ArrayList<PlaylistItem>(minOf(lines.size / 2, MAX_ITEMS))
         var pendingName = ""
         var pendingGroup = ""
         var pendingLogo = ""
 
         fun attr(line: String, key: String): String {
-            val regex = Regex("$key\\s*=\\s*\\\"([^\\\"]*)\\\"", RegexOption.IGNORE_CASE)
+            val regex = Regex("(?:^|\\s)$key\\s*=\\s*\"([^\"]*)\"", RegexOption.IGNORE_CASE)
             return regex.find(line)?.groupValues?.getOrNull(1).orEmpty()
         }
+
+        fun looksLikeHlsManifest(value: String): Boolean =
+            value.contains("#EXT-X-TARGETDURATION", true) ||
+                value.contains("#EXT-X-MEDIA-SEQUENCE", true) ||
+                value.contains("#EXT-X-STREAM-INF", true) ||
+                value.contains("#EXT-X-ENDLIST", true)
+
+        fun looksLikeDashManifest(value: String): Boolean =
+            value.contains("<MPD", true) && value.contains("</MPD", true)
+
+        if (looksLikeDashManifest(text)) {
+            val label = baseUrl.substringAfterLast('/').substringBefore('?').ifBlank { "DASH Stream" }
+            return listOf(PlaylistItem("DASH • $label", baseUrl))
+        }
+        if (looksLikeHlsManifest(text)) {
+            val label = baseUrl.substringAfterLast('/').substringBefore('?').ifBlank { "HLS Stream" }
+            return listOf(PlaylistItem("HLS • $label", baseUrl))
+        }
+
 
         fun titleFromExtinf(line: String): String {
             val comma = line.indexOf(',')
@@ -90,7 +109,9 @@ object PlaylistStore {
         }
 
         fun resolveUrl(raw: String): String {
-            val value = try { URLDecoder.decode(raw.trim(), StandardCharsets.UTF_8.name()) } catch (_: Throwable) { raw.trim() }
+            // IPTV M3U sering memakai `url|User-Agent=...&Referer=...`. Standar DLNA
+            // AVTransport hanya menerima URL media; header tidak bisa ikut dikirim sebagai bagian URL.
+            val value = raw.trim().substringBefore('|').trim()
             if (value.startsWith("http://", true) || value.startsWith("https://", true)) return value
             return try {
                 if (baseUrl.isBlank()) value else java.net.URI(baseUrl).resolve(value).toString()
@@ -110,7 +131,7 @@ object PlaylistStore {
                 line.startsWith("#") -> Unit
                 else -> {
                     val url = resolveUrl(line)
-                    if ((url.startsWith("http://", true) || url.startsWith("https://", true)) && out.size < 2000) {
+                    if ((url.startsWith("http://", true) || url.startsWith("https://", true)) && out.size < MAX_ITEMS) {
                         val name = pendingName.ifBlank { url.substringAfterLast('/').substringBefore('?').ifBlank { "Channel ${out.size + 1}" } }
                         out += PlaylistItem(name, url, pendingGroup, pendingLogo)
                     }

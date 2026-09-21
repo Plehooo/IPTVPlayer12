@@ -10,6 +10,7 @@ import android.content.res.ColorStateList
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
+import android.graphics.drawable.ColorDrawable
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
@@ -18,13 +19,18 @@ import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
 import android.text.InputType
+import android.text.TextUtils
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.WindowInsets
 import android.widget.ArrayAdapter
+import android.widget.AbsListView
+import android.widget.BaseAdapter
 import android.widget.Button
 import android.widget.EditText
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ListView
 import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
@@ -65,7 +71,9 @@ class MainActivity : Activity() {
     private lateinit var startButton: Button
     private lateinit var stopButton: Button
     private lateinit var playlistUrlInput: EditText
-    private lateinit var playlistList: LinearLayout
+    private lateinit var playlistList: ListView
+    private lateinit var playlistAdapter: PlaylistAdapter
+    private lateinit var playlistEmpty: TextView
     private lateinit var playlistStatus: TextView
     private var playlistItems: List<PlaylistItem> = emptyList()
     private var playlistBusy = false
@@ -280,7 +288,7 @@ class MainActivity : Activity() {
         // Mode ini tidak memakai MediaProjection: URL playlist dikirim langsung ke renderer DLNA.
         val playlistCard = addCard(root, "Playlist DLNA • tanpa mirror")
         playlistUrlInput = EditText(this).apply {
-            hint = "URL M3U/M3U8 playlist"
+            hint = "URL M3U / M3U8 / MPD playlist"
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
             setSingleLine(true)
             setText(PlaylistStore.loadUrl(this@MainActivity))
@@ -327,15 +335,36 @@ class MainActivity : Activity() {
         }
         playlistCard.addView(playlistStatus)
 
-        val playlistScroll = ScrollView(this).apply {
-            isFillViewport = false
-            layoutParams = LinearLayout.LayoutParams(-1, dp(260))
+        // ListView memakai view recycling: ribuan channel tidak lagi dibuat menjadi ribuan Button
+        // sekaligus, tetapi tetap memakai gaya tombol yang sama dan tetap scroll di dalam kartu.
+        playlistEmpty = TextView(this).apply {
+            text = "Belum ada item playlist."
+            textSize = 12f
+            setTextColor(C_MUTED)
+            setPadding(0, dp(8), 0, dp(8))
         }
-        playlistList = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
+        playlistAdapter = PlaylistAdapter()
+        playlistList = ListView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(-1, dp(360))
+            divider = ColorDrawable(0x00000000)
+            dividerHeight = dp(5)
+            isVerticalScrollBarEnabled = true
+            isScrollbarFadingEnabled = true
+            setBackgroundColor(0x00000000)
+            emptyView = playlistEmpty
+            adapter = playlistAdapter
+            setOnTouchListener { v, event ->
+                when (event.actionMasked) {
+                    MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE ->
+                        v.parent?.requestDisallowInterceptTouchEvent(true)
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL ->
+                        v.parent?.requestDisallowInterceptTouchEvent(false)
+                }
+                false
+            }
         }
-        playlistScroll.addView(playlistList)
-        playlistCard.addView(playlistScroll)
+        playlistCard.addView(playlistList)
+        playlistCard.addView(playlistEmpty, LinearLayout.LayoutParams(-1, -2))
 
         // Muat item cache agar playlist tetap bisa ditekan saat aplikasi dibuka ulang.
         playlistItems = PlaylistStore.loadItems(this)
@@ -498,7 +527,7 @@ class MainActivity : Activity() {
         if (playlistBusy) return
         val url = playlistUrlInput.text.toString().trim()
         if (!url.startsWith("http://", true) && !url.startsWith("https://", true)) {
-            playlistStatus.text = "Masukkan URL http(s) playlist M3U."
+            playlistStatus.text = "Masukkan URL http(s) M3U / M3U8 / MPD."
             return
         }
         PlaylistStore.saveUrl(this, url)
@@ -506,35 +535,55 @@ class MainActivity : Activity() {
         playlistStatus.text = if (force) "Memuat ulang playlist…" else "Memuat playlist…"
         executor.execute {
             try {
-                val connection = URL(url).openConnection() as HttpURLConnection
-                connection.connectTimeout = 7000
-                connection.readTimeout = 10000
-                connection.useCaches = false
-                connection.requestMethod = "GET"
-                connection.setRequestProperty("Cache-Control", "no-cache")
-                connection.setRequestProperty("User-Agent", "A01Mirror/Playlist")
-                val code = connection.responseCode
-                if (code !in 200..299) throw IllegalStateException("HTTP $code")
-                val finalUrl = connection.url?.toString().orEmpty().ifBlank { url }
-                val text = connection.inputStream.use { input ->
-                    val reader = input.bufferedReader(StandardCharsets.UTF_8)
-                    val buffer = CharArray(8192)
-                    val out = StringBuilder()
-                    var total = 0
-                    while (true) {
-                        val read = reader.read(buffer)
-                        if (read <= 0) break
-                        total += read
-                        if (total > 12 * 1024 * 1024) throw IllegalStateException("playlist terlalu besar (>12 MB)")
-                        out.append(buffer, 0, read)
+                val lower = url.substringBefore('?').lowercase(Locale.US)
+                val directMedia = lower.endsWith(".ts") || lower.endsWith(".mp4") || lower.endsWith(".mkv") ||
+                    lower.endsWith(".webm") || lower.endsWith(".mov") || lower.endsWith(".avi") ||
+                    lower.endsWith(".m4v") || lower.endsWith(".m2ts") || lower.endsWith(".mpegts") ||
+                    lower.endsWith(".mp3") || lower.endsWith(".aac") || lower.endsWith(".ac3") || lower.endsWith(".eac3") ||
+                    lower.endsWith(".m4a") || lower.endsWith(".flac") || lower.endsWith(".wav") ||
+                    lower.endsWith(".ogg") || lower.endsWith(".oga") || lower.endsWith(".opus")
+
+                val parsed: List<PlaylistItem>
+                if (directMedia) {
+                    val cleanUrl = url.substringBefore('|').trim()
+                    val name = cleanUrl.substringAfterLast('/').substringBefore('?').ifBlank { "Media" }
+                    parsed = listOf(PlaylistItem(name, cleanUrl))
+                } else {
+                    val connection = URL(url).openConnection() as HttpURLConnection
+                    try {
+                        connection.connectTimeout = 7000
+                        connection.readTimeout = 12000
+                        connection.useCaches = false
+                        connection.instanceFollowRedirects = true
+                        connection.requestMethod = "GET"
+                        connection.setRequestProperty("Cache-Control", "no-cache")
+                        connection.setRequestProperty("Accept", "*/*")
+                        connection.setRequestProperty("User-Agent", "A01Mirror/Playlist")
+                        val code = connection.responseCode
+                        if (code !in 200..299) throw IllegalStateException("HTTP $code")
+                        val finalUrl = connection.url?.toString().orEmpty().ifBlank { url }
+                        val text = connection.inputStream.use { input ->
+                            val reader = input.bufferedReader(StandardCharsets.UTF_8)
+                            val buffer = CharArray(8192)
+                            val out = StringBuilder()
+                            var total = 0
+                            while (true) {
+                                val read = reader.read(buffer)
+                                if (read <= 0) break
+                                total += read
+                                if (total > 16 * 1024 * 1024) throw IllegalStateException("playlist terlalu besar (>16 MB)")
+                                out.append(buffer, 0, read)
+                            }
+                            out.toString()
+                        }
+                        parsed = PlaylistStore.parse(text, finalUrl)
+                    } finally {
+                        connection.disconnect()
                     }
-                    out.toString()
                 }
-                connection.disconnect()
-                val parsed = PlaylistStore.parse(text, finalUrl)
+
                 runOnUiThread {
                     playlistBusy = false
-                    playlistItems = parsed
                     PlaylistStore.saveItems(this, parsed)
                     renderPlaylist(parsed)
                     playlistStatus.text = if (parsed.isEmpty()) {
@@ -544,13 +593,24 @@ class MainActivity : Activity() {
                     }
                 }
             } catch (t: Throwable) {
-                runOnUiThread {
-                    playlistBusy = false
-                    playlistStatus.text = "Gagal memuat playlist: ${t.message ?: "URL tidak bisa dibaca"}. Cache lama tetap tersedia."
-                    val cached = PlaylistStore.loadItems(this)
-                    if (cached.isNotEmpty()) {
-                        playlistItems = cached
-                        renderPlaylist(cached)
+                val lowerUrl = url.substringBefore('?').lowercase(Locale.US)
+                val directManifest = lowerUrl.endsWith(".m3u8") || lowerUrl.endsWith(".mpd")
+                if (directManifest) {
+                    val cleanUrl = url.substringBefore('|').trim()
+                    val title = if (lowerUrl.endsWith(".mpd")) "DASH • Stream" else "HLS • Stream"
+                    val direct = listOf(PlaylistItem(title, cleanUrl))
+                    runOnUiThread {
+                        playlistBusy = false
+                        PlaylistStore.saveItems(this, direct)
+                        renderPlaylist(direct)
+                        playlistStatus.text = "Manifest langsung siap dikirim ke TV. Format/codec tetap bergantung firmware A01."
+                    }
+                } else {
+                    runOnUiThread {
+                        playlistBusy = false
+                        playlistStatus.text = "Gagal memuat playlist: ${t.message ?: "URL tidak bisa dibaca"}. Cache lama tetap tersedia."
+                        val cached = PlaylistStore.loadItems(this)
+                        if (cached.isNotEmpty()) renderPlaylist(cached)
                     }
                 }
             }
@@ -559,49 +619,53 @@ class MainActivity : Activity() {
 
     private fun renderPlaylist(items: List<PlaylistItem>) {
         if (!::playlistList.isInitialized) return
-        playlistList.removeAllViews()
+        playlistItems = items
+        playlistAdapter.update(items)
+        playlistList.setSelection(0)
         if (items.isEmpty()) {
-            playlistList.addView(TextView(this).apply {
-                text = "Belum ada item playlist."
-                textSize = 12f
-                setTextColor(C_MUTED)
-                setPadding(0, dp(8), 0, dp(8))
-            })
-            return
+            playlistEmpty.text = "Belum ada channel/media."
+        }
+    }
+
+    /** Recycler sederhana berbasis Button; struktur UI tetap sama, tetapi 5000 item tidak dibuat sekaligus. */
+    private inner class PlaylistAdapter : BaseAdapter() {
+        private var data: List<PlaylistItem> = emptyList()
+
+        fun update(value: List<PlaylistItem>) {
+            data = value
+            notifyDataSetChanged()
+            playlistEmpty.visibility = if (data.isEmpty()) android.view.View.VISIBLE else android.view.View.GONE
         }
 
-        items.take(500).forEachIndexed { index, item ->
-            val button = Button(this).apply {
-                text = buildString {
-                    append(index + 1).append(". ").append(item.name)
-                    if (item.group.isNotBlank()) append("  •  ").append(item.group)
-                }
-                isAllCaps = false
-                textSize = 13f
-                typeface = Typeface.DEFAULT_BOLD
-                gravity = Gravity.START or Gravity.CENTER_VERTICAL
-                minHeight = dp(48)
-                minimumHeight = dp(48)
-                setTextColor(C_TEXT)
-                background = RippleDrawable(
-                    ColorStateList.valueOf(0x335C6BF0),
-                    rounded(C_FIELD, 12, C_STROKE),
-                    null
-                )
-                setPadding(dp(12), dp(4), dp(12), dp(4))
-                setOnClickListener { castPlaylistItem(item) }
+        override fun getCount(): Int = data.size
+        override fun getItem(position: Int): PlaylistItem = data[position]
+        override fun getItemId(position: Int): Long = position.toLong()
+
+        override fun getView(position: Int, convertView: android.view.View?, parent: android.view.ViewGroup): android.view.View {
+            val button = (convertView as? Button) ?: Button(this@MainActivity)
+            val item = data[position]
+            button.text = buildString {
+                append(position + 1).append(". ").append(item.name)
+                if (item.group.isNotBlank()) append("  •  ").append(item.group)
             }
-            playlistList.addView(button, LinearLayout.LayoutParams(-1, dp(52)).apply {
-                bottomMargin = dp(5)
-            })
-        }
-        if (items.size > 500) {
-            playlistList.addView(TextView(this).apply {
-                text = "Menampilkan 500 item pertama dari ${items.size}."
-                textSize = 11f
-                setTextColor(C_MUTED)
-                setPadding(0, dp(8), 0, dp(8))
-            })
+            button.isAllCaps = false
+            button.textSize = 13f
+            button.typeface = Typeface.DEFAULT_BOLD
+            button.gravity = Gravity.START or Gravity.CENTER_VERTICAL
+            button.minHeight = 0
+            button.minimumHeight = 0
+            button.maxLines = 2
+            button.ellipsize = TextUtils.TruncateAt.END
+            button.setTextColor(C_TEXT)
+            button.background = RippleDrawable(
+                ColorStateList.valueOf(0x335C6BF0),
+                rounded(C_FIELD, 12, C_STROKE),
+                null
+            )
+            button.setPadding(dp(12), dp(4), dp(12), dp(4))
+            button.layoutParams = AbsListView.LayoutParams(-1, dp(52))
+            button.setOnClickListener { castPlaylistItem(item) }
+            return button
         }
     }
 
@@ -660,7 +724,8 @@ class MainActivity : Activity() {
                 append("Video  : ").append(b.videoFrames).append(" frame • ")
                     .append(String.format(Locale.US, "%.2f Mbps", mbps)).append('\n')
                 append("STB    : ").append(b.clientCount).append(" terhubung\n")
-                append("Drop   : ").append(b.droppedClientPackets).append(" paket kirim\n")
+                append("Drop   : ").append(b.droppedClientPackets).append(" video • ")
+                    .append(b.droppedClientAudioPackets).append(" audio\n")
                 append("Rekam  : ").append(recLine)
                 if (b.recordingGaps > 0L) append(" • celah ").append(b.recordingGaps)
                 if (b.recordingName.isNotEmpty()) append("\nFile   : ").append(b.recordingName)

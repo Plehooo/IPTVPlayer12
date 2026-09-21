@@ -129,3 +129,13 @@ Semua bersifat tambahan; tidak ada file/fitur yang dihapus.
 - Mode **Playlist DLNA tanpa mirror** tetap satu APK yang sama: M3U/M3U8 dimuat, disimpan sebagai cache, item dapat ditekan satu per satu, dan URL dikirim langsung ke DMR.
 - Tombol **Stop TV / Playlist** menghentikan pemutaran langsung tanpa menyentuh sesi screen-mirroring.
 - Tidak ada file project lama yang dihapus; perubahan hanya menambah kemampuan dan memperketat jalur live.
+
+
+## Update 1.6.0 — audio smooth + anti-burst TS + playlist besar
+- Audio muxing dipisahkan dari muxing video besar supaya frame audio tidak ikut menunggu IDR.
+- MPEG-TS live dipecah 7 paket TS (1316 byte) dan langsung di-flush tiap unit untuk mengurangi burst di socket.
+- Saat writer sempat tertahan, scheduler wire tidak mengejar backlog dengan burst; data video lama di-resync ke IDR baru.
+- Antrean audio dipertahankan dalam jendela pendek saat resync video agar mute gap tidak melebar.
+- URL direct dengan suffix media tambahan (M4V, M2TS, MPEG-TS, AC3/E-AC3, WAV, OGG/Opus) dikenali tanpa mengubah pipeline DLNA.
+- Playlist memakai ListView + recycling, sehingga ribuan item tetap dapat di-scroll tanpa membuat ribuan Button sekaligus.
+- HLS/M3U8 dan DASH/MPD tetap dapat dikirim langsung bila renderer menerima format tersebut; renderer A01 tetap menentukan codec/fitur yang benar-benar dapat diputar.

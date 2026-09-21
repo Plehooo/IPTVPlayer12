@@ -266,10 +266,11 @@ object DlnaController {
      * separate from live mirror: the STB fetches the public HTTP(S) URL itself.
      */
     fun playDirect(renderer: Renderer, mediaUrl: String, title: String = "Media"): Result<Unit> {
+        val cleanMediaUrl = mediaUrl.substringBefore('|').trim()
         if (renderer.avTransportControlUrl.isBlank()) {
             return Result.failure(IllegalStateException("AVTransport tidak tersedia"))
         }
-        if (!mediaUrl.startsWith("http://") && !mediaUrl.startsWith("https://")) {
+        if (!cleanMediaUrl.startsWith("http://") && !cleanMediaUrl.startsWith("https://")) {
             return Result.failure(IllegalArgumentException("URL media tidak valid"))
         }
 
@@ -277,7 +278,7 @@ object DlnaController {
             add(renderer.avTransportServiceType.ifBlank { AV_TYPE_DEFAULT })
             add(AV_TYPE_DEFAULT)
         }
-        val metadataAttempts = listOf(directDidlMetadata(mediaUrl, title), "")
+        val metadataAttempts = listOf(directDidlMetadata(cleanMediaUrl, title), "")
         var lastError: Throwable? = null
 
         for (serviceType in serviceTypes) {
@@ -290,7 +291,7 @@ object DlnaController {
                         serviceType,
                         "SetAVTransportURI",
                         "<InstanceID>0</InstanceID>" +
-                            "<CurrentURI>${xml(mediaUrl)}</CurrentURI>" +
+                            "<CurrentURI>${xml(cleanMediaUrl)}</CurrentURI>" +
                             "<CurrentURIMetaData>${xml(metadata)}</CurrentURIMetaData>"
                     )
                     // A01 firmware needs a short hand-off here, but not the long buffering window used
@@ -1021,15 +1022,28 @@ object DlnaController {
     }
 
     private fun directDidlMetadata(url: String, title: String): String {
+        val cleanUrl = url.substringBefore('|')
+        val lowerUrl = cleanUrl.lowercase(Locale.US)
         val mime = when {
-            url.contains(".m3u8", true) -> "application/vnd.apple.mpegurl"
-            url.contains(".mpd", true) -> "application/dash+xml"
-            url.contains(".mp4", true) -> "video/mp4"
-            url.contains(".mkv", true) -> "video/x-matroska"
-            url.contains(".webm", true) -> "video/webm"
-            url.contains(".mp3", true) -> "audio/mpeg"
-            url.contains(".aac", true) -> "audio/aac"
-            url.contains(".jpg", true) || url.contains(".jpeg", true) -> "image/jpeg"
+            lowerUrl.contains(".m3u8") -> "application/vnd.apple.mpegurl"
+            lowerUrl.contains(".mpd") -> "application/dash+xml"
+            lowerUrl.contains(".mp4") -> "video/mp4"
+            lowerUrl.contains(".m4v") -> "video/mp4"
+            lowerUrl.contains(".mkv") -> "video/x-matroska"
+            lowerUrl.contains(".webm") -> "video/webm"
+            lowerUrl.contains(".mov") -> "video/quicktime"
+            lowerUrl.contains(".avi") -> "video/x-msvideo"
+            lowerUrl.contains(".ts") || lowerUrl.contains(".m2ts") || lowerUrl.contains(".mpegts") || lowerUrl.contains(".mpeg") || lowerUrl.contains(".mpg") -> "video/mpeg"
+            lowerUrl.contains(".mp3") -> "audio/mpeg"
+            lowerUrl.contains(".aac") -> "audio/aac"
+            lowerUrl.contains(".ac3") -> "audio/ac3"
+            lowerUrl.contains(".eac3") -> "audio/eac3"
+            lowerUrl.contains(".m4a") -> "audio/mp4"
+            lowerUrl.contains(".flac") -> "audio/flac"
+            lowerUrl.contains(".wav") -> "audio/wav"
+            lowerUrl.contains(".ogg") || lowerUrl.contains(".oga") || lowerUrl.contains(".opus") -> "audio/ogg"
+            lowerUrl.contains(".jpg") || lowerUrl.contains(".jpeg") -> "image/jpeg"
+            lowerUrl.contains(".png") -> "image/png"
             else -> "video/mpeg"
         }
         val protocolInfo = "http-get:*:$mime:*"
@@ -1039,7 +1053,7 @@ object DlnaController {
             "<item id=\"1\" parentID=\"0\" restricted=\"1\">" +
             "<dc:title>${xml(title.ifBlank { "Media" })}</dc:title>" +
             "<upnp:class>${if (mime.startsWith("audio/")) "object.item.audioItem.musicTrack" else "object.item.videoItem"}</upnp:class>" +
-            "<res protocolInfo=\"${xml(protocolInfo)}\">${xml(url)}</res>" +
+            "<res protocolInfo=\"${xml(protocolInfo)}\">${xml(cleanUrl)}</res>" +
             "</item></DIDL-Lite>"
     }
 

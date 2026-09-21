@@ -19,8 +19,9 @@ class MpegTsMuxer {
         private const val PROGRAM_NUMBER = 1
         private const val PES_HEADER_SIZE = 14
 
-        // PCR mengikuti PTS video pada jalur live: ini menghindari clock separation buatan
-        // yang sebelumnya dapat membuat renderer murah menambah buffer.
+        // PCR mengikuti PTS video pada jalur live. PCR ditempatkan pada paket TS pertama setiap
+        // access-unit video (≈ setiap frame), jauh lebih rapat daripada interval minimum sehingga
+        // clock renderer murah tetap terkunci ke video tanpa menunggu blok besar.
         private const val PCR_LEAD_90K = 0L
     }
 
