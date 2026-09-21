@@ -26,36 +26,42 @@ class AudioCapture(
         if (android.os.Build.VERSION.SDK_INT < 29) return
 
         // 48 kHz dulu (standar TV/DVB, sama dengan -ar 48000 di tar v6), 44.1 kHz cadangan.
-        val rates = intArrayOf(48000, 44100)
+        val rates = intArrayOf(48000, 44100, 32000)
+        val channelMasks = intArrayOf(AudioFormat.CHANNEL_IN_STEREO, AudioFormat.CHANNEL_IN_MONO)
         var ar: AudioRecord? = null
         var selectedRate = 48000
+        var selectedChannels = 2
         for (rate in rates) {
-            try {
-                val minBuffer = AudioRecord.getMinBufferSize(
-                    rate,
-                    AudioFormat.CHANNEL_IN_STEREO,
-                    AudioFormat.ENCODING_PCM_16BIT
-                )
-                if (minBuffer <= 0) continue
+            for (mask in channelMasks) {
+                try {
+                    val minBuffer = AudioRecord.getMinBufferSize(
+                        rate,
+                        mask,
+                        AudioFormat.ENCODING_PCM_16BIT
+                    )
+                    if (minBuffer <= 0) continue
 
-                val config = AudioPlaybackCaptureConfigurationCompat.build(projection)
-                val format = AudioFormat.Builder()
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .setSampleRate(rate)
-                    .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
-                    .build()
+                    val config = AudioPlaybackCaptureConfigurationCompat.build(projection)
+                    val format = AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(rate)
+                        .setChannelMask(mask)
+                        .build()
 
-                ar = AudioRecord.Builder()
-                    .setAudioFormat(format)
-                    .setBufferSizeInBytes((minBuffer * 3 / 2).coerceAtLeast(minBuffer))
-                    .setAudioPlaybackCaptureConfig(config)
-                    .build()
-                selectedRate = rate
-                break
-            } catch (_: Throwable) {
-                try { ar?.release() } catch (_: Exception) {}
-                ar = null
+                    ar = AudioRecord.Builder()
+                        .setAudioFormat(format)
+                        .setBufferSizeInBytes((minBuffer * 2).coerceAtLeast(minBuffer))
+                        .setAudioPlaybackCaptureConfig(config)
+                        .build()
+                    selectedRate = rate
+                    selectedChannels = if (mask == AudioFormat.CHANNEL_IN_MONO) 1 else 2
+                    break
+                } catch (_: Throwable) {
+                    try { ar?.release() } catch (_: Exception) {}
+                    ar = null
+                }
             }
+            if (ar != null) break
         }
 
         if (ar == null) {
@@ -65,15 +71,15 @@ class AudioCapture(
         }
 
         sampleRate = selectedRate
-        channels = 2
+        channels = selectedChannels
         record = ar
         lame = try {
             LameBuilder()
             .setInSampleRate(sampleRate)
             .setOutChannels(channels)
-            .setOutBitrate(96)
+            .setOutBitrate(128)
             .setOutSampleRate(sampleRate)
-            .setQuality(7)
+            .setQuality(5)
             .build()
         } catch (t: Throwable) {
             // Library MP3 native tidak bisa dimuat di ABI HP ini: tetap siarkan video + audio senyap.
@@ -172,13 +178,18 @@ class AudioCapture(
         }
     }
 
-    /** Satu frame MPEG-1 Layer III berisi nol (side info nol = keluaran senyap), 96 kbps stereo. */
+    /** Satu frame MPEG-1 Layer III senyap; header sample-rate harus cocok dengan frame sebenarnya. */
     private fun silentFrame(rate: Int): ByteArray {
-        val rateIndex = if (rate == 44100) 0 else 1
-        val frame = ByteArray(144 * 96000 / rate)
+        val rateIndex = when (rate) {
+            48000 -> 0
+            44100 -> 1
+            else -> 2
+        }
+        val bitrateIndex = 9 // 128 kbps pada MPEG-1 Layer III.
+        val frame = ByteArray(144 * 128000 / rate)
         frame[0] = 0xFF.toByte()
         frame[1] = 0xFB.toByte()
-        frame[2] = ((7 shl 4) or (rateIndex shl 2)).toByte()
+        frame[2] = ((bitrateIndex shl 4) or (rateIndex shl 2)).toByte()
         return frame
     }
 }

@@ -19,9 +19,9 @@ class MpegTsMuxer {
         private const val PROGRAM_NUMBER = 1
         private const val PES_HEADER_SIZE = 14
 
-        // PCR dibuat 180 ms lebih awal dari PTS supaya decoder STB punya bantalan
-        // (PTS - PCR > 0) dan tidak menampilkan frame "terlambat" saat jaringan bergetar.
-        private const val PCR_LEAD_90K = 16_200L
+        // PCR mengikuti PTS video pada jalur live: ini menghindari clock separation buatan
+        // yang sebelumnya dapat membuat renderer murah menambah buffer.
+        private const val PCR_LEAD_90K = 0L
     }
 
     private val continuity = HashMap<Int, Int>()

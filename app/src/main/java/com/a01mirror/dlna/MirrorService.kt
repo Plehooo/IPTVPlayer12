@@ -24,6 +24,7 @@ class MirrorService : Service() {
         const val EXTRA_FPS = "fps"
         const val EXTRA_AUTO_SIZE = "auto_size"
         const val EXTRA_AUTO_FPS = "auto_fps"
+        const val EXTRA_RECORD = "record"
         const val EXTRA_RENDERER_LOCATION = "renderer_location"
         const val EXTRA_RENDERER_CONTROL_URL = "renderer_control_url"
         const val EXTRA_RENDERER_SERVICE_TYPE = "renderer_service_type"
@@ -121,7 +122,8 @@ class MirrorService : Service() {
             projection = pm.getMediaProjection(resultCode, data)
                 ?: throw IllegalStateException("MediaProjection tidak tersedia")
 
-            val stream = TsBroadcaster(contentResolver)
+            val recordEnabled = intent.getBooleanExtra(EXTRA_RECORD, true)
+            val stream = TsBroadcaster(contentResolver, enableRecording = recordEnabled)
             broadcaster = stream
             activeBroadcaster = stream
             http = LiveHttpServer(stream, stream.sessionToken).also { it.start() }
@@ -129,7 +131,7 @@ class MirrorService : Service() {
             // IP HP dihitung ke arah STB (bukan asal ambil wlan0) supaya URL stream terbaca STB.
             val ip = localIpv4For(this, target.host)
             val streamUrl = "http://$ip:${http!!.port}/a01/${stream.sessionToken}/stream.ts"
-            notifyBase = "Live ${width}×${height}@${fps}fps"
+            notifyBase = "Live ${width}×${height}@${fps}fps" + if (recordEnabled) " • Rekam" else " • Mirror saja"
             updateNotification(liveSummary(stream))
 
             encoder = H264Encoder(
@@ -270,8 +272,8 @@ class MirrorService : Service() {
             wifiLock = null
         }
 
-        // Mode low-latency hanya aktif bila aplikasi tampil di depan. Saat user membuka game/aplikasi
-        // lain, kunci high-perf menjaga Wi-Fi tidak masuk mode hemat daya (penyebab stream tersendat).
+        // Mode low-latency dipertahankan untuk foreground; high-perf di bawah membantu saat user
+        // berpindah ke aplikasi lain sehingga service mirror tidak kehilangan jalur Wi-Fi.
         try {
             val manager = getSystemService(android.net.wifi.WifiManager::class.java)
             val lock = manager.createWifiLock(

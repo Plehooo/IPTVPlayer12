@@ -30,6 +30,9 @@ import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import java.util.Locale
+import java.net.HttpURLConnection
+import java.net.URL
+import java.nio.charset.StandardCharsets
 import java.util.concurrent.Executors
 
 // Palet warna UI (gelap, aksen indigo + cyan) — sama dengan logo aplikasi.
@@ -61,6 +64,11 @@ class MainActivity : Activity() {
     private lateinit var liveText: TextView
     private lateinit var startButton: Button
     private lateinit var stopButton: Button
+    private lateinit var playlistUrlInput: EditText
+    private lateinit var playlistList: LinearLayout
+    private lateinit var playlistStatus: TextView
+    private var playlistItems: List<PlaylistItem> = emptyList()
+    private var playlistBusy = false
 
     private var lastBytes = 0L
     private var lastBytesMs = 0L
@@ -268,6 +276,71 @@ class MainActivity : Activity() {
         }
         stbCard.addView(deviceText)
 
+        // ---- Kartu tambahan: playlist DLNA langsung ----
+        // Mode ini tidak memakai MediaProjection: URL playlist dikirim langsung ke renderer DLNA.
+        val playlistCard = addCard(root, "Playlist DLNA • tanpa mirror")
+        playlistUrlInput = EditText(this).apply {
+            hint = "URL M3U/M3U8 playlist"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+            setSingleLine(true)
+            setText(PlaylistStore.loadUrl(this@MainActivity))
+            setTextColor(C_TEXT)
+            setHintTextColor(C_MUTED)
+            textSize = 14.5f
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            background = rounded(C_FIELD, 12, C_STROKE)
+        }
+        playlistCard.addView(playlistUrlInput, LinearLayout.LayoutParams(-1, -2))
+
+        val playlistButtons = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        playlistButtons.addView(
+            styledButton("Muat Playlist", C_GREEN) { loadPlaylist() },
+            LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(6) }
+        )
+        playlistButtons.addView(
+            styledButton("Refresh", C_ACCENT, outline = true) { loadPlaylist(true) },
+            LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(6) }
+        )
+        playlistCard.addView(playlistButtons, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
+
+        // Stop terpisah untuk mode playlist: tidak menyentuh MediaProjection / MirrorService.
+        playlistCard.addView(
+            styledButton("■  Stop TV / Playlist", C_RED, outline = true) {
+                val r = selected
+                if (r == null) {
+                    Toast.makeText(this, "Pilih STB DLNA dulu.", Toast.LENGTH_SHORT).show()
+                } else {
+                    executor.execute {
+                        DlnaController.stop(r)
+                        runOnUiThread { playlistStatus.text = "TV dihentikan." }
+                    }
+                }
+            },
+            LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) }
+        )
+
+        playlistStatus = TextView(this).apply {
+            textSize = 11.5f
+            setTextColor(C_MUTED)
+            text = "Belum ada playlist. URL disimpan otomatis."
+            setPadding(0, dp(10), 0, dp(8))
+        }
+        playlistCard.addView(playlistStatus)
+
+        val playlistScroll = ScrollView(this).apply {
+            isFillViewport = false
+            layoutParams = LinearLayout.LayoutParams(-1, dp(260))
+        }
+        playlistList = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        playlistScroll.addView(playlistList)
+        playlistCard.addView(playlistScroll)
+
+        // Muat item cache agar playlist tetap bisa ditekan saat aplikasi dibuka ulang.
+        playlistItems = PlaylistStore.loadItems(this)
+        renderPlaylist(playlistItems)
+
         // ---- Kartu 2: kualitas ----
         val qualityCard = addCard(root, "Kualitas")
         qualityCard.addView(label("Resolusi"))
@@ -290,7 +363,7 @@ class MainActivity : Activity() {
         fpsSpinner.setSelection(3)
         qualityCard.addView(fpsSpinner, LinearLayout.LayoutParams(-1, -2))
         qualityCard.addView(TextView(this).apply {
-            text = "Pilihan apa pun otomatis diturunkan ke batas kemampuan encoder HP ini (fps dulu, lalu resolusi)."
+            text = "Otomatis memprioritaskan kestabilan saat aplikasi berat terbuka; encoder tetap menyesuaikan kemampuan HP (fps dulu, lalu resolusi). Untuk beban paling ringan, gunakan Mirror saja."
             textSize = 11.5f
             setTextColor(C_MUTED)
             setPadding(0, dp(8), 0, 0)
@@ -300,6 +373,10 @@ class MainActivity : Activity() {
         val controlCard = addCard(root, "Kontrol")
         startButton = styledButton("▶  Mulai Mirror + Rekam", C_ACCENT) { requestCapture() }
         controlCard.addView(startButton, LinearLayout.LayoutParams(-1, -2))
+        val mirrorOnlyButton = styledButton("▶  Mirror saja • lebih ringan", C_GREEN, outline = true) {
+            requestCapture(record = false)
+        }
+        controlCard.addView(mirrorOnlyButton, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
         stopButton = styledButton("■  Stop", C_RED, outline = true) {
             stopService(Intent(this@MainActivity, MirrorService::class.java))
             status.text = "Mirror dihentikan."
@@ -349,9 +426,10 @@ class MainActivity : Activity() {
         }
 
         val note = TextView(this).apply {
-            text = "Catatan: DLNA STP-A01 bukan receiver Miracast. Aplikasi ini mengirim live H.264 + MP3 " +
-                "melalui HTTP/DLNA. Agar tidak tersendat saat membuka aplikasi berat, set baterai aplikasi ini " +
-                "ke \"Tanpa batasan\" (tombol Izin baterai). Hasil akhir bergantung firmware STP-A01."
+            text = "Catatan: DLNA STP-A01 bukan receiver Miracast. Satu APK ini punya 2 mode: mirror layar + audio " +
+                "dan playlist yang dikirim langsung ke TV tanpa mirror. Untuk mirror, set baterai aplikasi ini ke " +
+                "\"Tanpa batasan\" (tombol Izin baterai) agar service tidak dibatasi saat membuka aplikasi berat. " +
+                "Playback playlist tetap bergantung format yang didukung firmware STP-A01."
             textSize = 11.5f
             setTextColor(C_MUTED)
             setPadding(dp(4), dp(4), dp(4), 0)
@@ -412,6 +490,136 @@ class MainActivity : Activity() {
                 startActivity(Intent(Settings.ACTION_SETTINGS))
             } catch (_: Exception) {
                 Toast.makeText(this, "Buka Pengaturan → Baterai → A01 Mirror → Tanpa batasan.", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    private fun loadPlaylist(force: Boolean = false) {
+        if (playlistBusy) return
+        val url = playlistUrlInput.text.toString().trim()
+        if (!url.startsWith("http://", true) && !url.startsWith("https://", true)) {
+            playlistStatus.text = "Masukkan URL http(s) playlist M3U."
+            return
+        }
+        PlaylistStore.saveUrl(this, url)
+        playlistBusy = true
+        playlistStatus.text = if (force) "Memuat ulang playlist…" else "Memuat playlist…"
+        executor.execute {
+            try {
+                val connection = URL(url).openConnection() as HttpURLConnection
+                connection.connectTimeout = 7000
+                connection.readTimeout = 10000
+                connection.useCaches = false
+                connection.requestMethod = "GET"
+                connection.setRequestProperty("Cache-Control", "no-cache")
+                connection.setRequestProperty("User-Agent", "A01Mirror/Playlist")
+                val code = connection.responseCode
+                if (code !in 200..299) throw IllegalStateException("HTTP $code")
+                val finalUrl = connection.url?.toString().orEmpty().ifBlank { url }
+                val text = connection.inputStream.use { input ->
+                    val reader = input.bufferedReader(StandardCharsets.UTF_8)
+                    val buffer = CharArray(8192)
+                    val out = StringBuilder()
+                    var total = 0
+                    while (true) {
+                        val read = reader.read(buffer)
+                        if (read <= 0) break
+                        total += read
+                        if (total > 12 * 1024 * 1024) throw IllegalStateException("playlist terlalu besar (>12 MB)")
+                        out.append(buffer, 0, read)
+                    }
+                    out.toString()
+                }
+                connection.disconnect()
+                val parsed = PlaylistStore.parse(text, finalUrl)
+                runOnUiThread {
+                    playlistBusy = false
+                    playlistItems = parsed
+                    PlaylistStore.saveItems(this, parsed)
+                    renderPlaylist(parsed)
+                    playlistStatus.text = if (parsed.isEmpty()) {
+                        "Playlist terbaca tapi tidak ada item http(s)."
+                    } else {
+                        "${parsed.size} channel/media siap diputar langsung ke TV."
+                    }
+                }
+            } catch (t: Throwable) {
+                runOnUiThread {
+                    playlistBusy = false
+                    playlistStatus.text = "Gagal memuat playlist: ${t.message ?: "URL tidak bisa dibaca"}. Cache lama tetap tersedia."
+                    val cached = PlaylistStore.loadItems(this)
+                    if (cached.isNotEmpty()) {
+                        playlistItems = cached
+                        renderPlaylist(cached)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun renderPlaylist(items: List<PlaylistItem>) {
+        if (!::playlistList.isInitialized) return
+        playlistList.removeAllViews()
+        if (items.isEmpty()) {
+            playlistList.addView(TextView(this).apply {
+                text = "Belum ada item playlist."
+                textSize = 12f
+                setTextColor(C_MUTED)
+                setPadding(0, dp(8), 0, dp(8))
+            })
+            return
+        }
+
+        items.take(500).forEachIndexed { index, item ->
+            val button = Button(this).apply {
+                text = buildString {
+                    append(index + 1).append(". ").append(item.name)
+                    if (item.group.isNotBlank()) append("  •  ").append(item.group)
+                }
+                isAllCaps = false
+                textSize = 13f
+                typeface = Typeface.DEFAULT_BOLD
+                gravity = Gravity.START or Gravity.CENTER_VERTICAL
+                minHeight = dp(48)
+                minimumHeight = dp(48)
+                setTextColor(C_TEXT)
+                background = RippleDrawable(
+                    ColorStateList.valueOf(0x335C6BF0),
+                    rounded(C_FIELD, 12, C_STROKE),
+                    null
+                )
+                setPadding(dp(12), dp(4), dp(12), dp(4))
+                setOnClickListener { castPlaylistItem(item) }
+            }
+            playlistList.addView(button, LinearLayout.LayoutParams(-1, dp(52)).apply {
+                bottomMargin = dp(5)
+            })
+        }
+        if (items.size > 500) {
+            playlistList.addView(TextView(this).apply {
+                text = "Menampilkan 500 item pertama dari ${items.size}."
+                textSize = 11f
+                setTextColor(C_MUTED)
+                setPadding(0, dp(8), 0, dp(8))
+            })
+        }
+    }
+
+    private fun castPlaylistItem(item: PlaylistItem) {
+        val renderer = selected
+        if (renderer == null) {
+            Toast.makeText(this, "Pilih / hubungkan STB DLNA dulu.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        playlistStatus.text = "Mengirim: ${item.name} → ${renderer.name}…"
+        executor.execute {
+            val result = DlnaController.playDirect(renderer, item.url, item.name)
+            runOnUiThread {
+                playlistStatus.text = if (result.isSuccess) {
+                    "▶ ${item.name} sedang diputar langsung oleh ${renderer.name}."
+                } else {
+                    "Gagal memutar ${item.name}: ${result.exceptionOrNull()?.message ?: "renderer menolak URL"}"
+                }
             }
         }
     }
@@ -525,7 +733,8 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun requestCapture() {
+    private fun requestCapture(record: Boolean = true) {
+        requestedRecord = record
         if (selected == null) {
             Toast.makeText(this, "Pilih STB DLNA dulu.", Toast.LENGTH_SHORT).show()
             return
@@ -539,6 +748,8 @@ class MainActivity : Activity() {
         val pm = getSystemService(MediaProjectionManager::class.java)
         startActivityForResult(pm.createScreenCaptureIntent(), REQUEST_CAPTURE)
     }
+
+    private var requestedRecord = true
 
     private fun startMirrorService(resultCode: Int, data: Intent, renderer: DlnaController.Renderer) {
         val width = if (resolutionSpinner.selectedItemPosition == 0) 1280 else 1920
@@ -557,6 +768,7 @@ class MainActivity : Activity() {
             putExtra(MirrorService.EXTRA_FPS, fps)
             putExtra(MirrorService.EXTRA_AUTO_SIZE, resolutionSpinner.selectedItemPosition == 2)
             putExtra(MirrorService.EXTRA_AUTO_FPS, fpsSpinner.selectedItemPosition == 3)
+            putExtra(MirrorService.EXTRA_RECORD, requestedRecord)
             putExtra(MirrorService.EXTRA_RENDERER_LOCATION, renderer.location)
             putExtra(MirrorService.EXTRA_RENDERER_CONTROL_URL, renderer.avTransportControlUrl)
             putExtra(MirrorService.EXTRA_RENDERER_SERVICE_TYPE, renderer.avTransportServiceType)
@@ -593,7 +805,7 @@ class MainActivity : Activity() {
             val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
             if (granted && waitingForAudioPermission) {
                 waitingForAudioPermission = false
-                requestCapture()
+                requestCapture(requestedRecord)
             } else if (!granted) {
                 waitingForAudioPermission = false
                 status.text = "Audio tidak diizinkan. Melanjutkan mirror tanpa audio internal…"

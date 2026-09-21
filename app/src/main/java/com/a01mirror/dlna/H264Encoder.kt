@@ -81,9 +81,11 @@ class H264Encoder(
             val perfClass = if (Build.VERSION.SDK_INT >= 31) Build.VERSION.MEDIA_PERFORMANCE_CLASS else 0
             return when {
                 lowRam || ramGb < 2.2 -> intArrayOf(848, 480, 25)
-                ramGb < 3.2 || cores < 6 -> intArrayOf(960, 540, 25)
-                perfClass >= 31 || (ramGb >= 5.0 && cores >= 8) -> intArrayOf(1280, 720, 30)
-                else -> intArrayOf(1280, 720, 25)
+                // Profil otomatis lebih konservatif pada HP menengah: 540p menjaga headroom
+                // saat user membuka YouTube/game/browser bersamaan dengan encoder hardware.
+                ramGb < 4.0 || cores < 8 -> intArrayOf(960, 540, 25)
+                perfClass >= 31 || (ramGb >= 6.0 && cores >= 8) -> intArrayOf(1280, 720, 25)
+                else -> intArrayOf(960, 540, 25)
             }
         }
 
@@ -184,7 +186,7 @@ class H264Encoder(
         running = true
         thread = Thread {
             // Thread encoder diberi prioritas tinggi supaya frame tetap mengalir saat aplikasi berat berjalan.
-            try { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY) } catch (_: Throwable) {}
+            try { Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY) } catch (_: Throwable) {}
             drainLoop()
         }.also {
             it.name = "A01-H264"
@@ -198,13 +200,17 @@ class H264Encoder(
     ): MediaFormat =
         MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+            // Conservative live bitrates keep inexpensive Wi-Fi/DLNA renderers close to the live edge.
+            // Quality is still high enough for UI/text at 720p while leaving headroom for audio + jitter.
             val bitrate = when {
-                width >= 1920 && fps >= 60 -> 5_000_000
-                width >= 1920 -> 4_000_000
-                fps >= 60 -> 3_000_000
-                fps >= 30 -> 2_400_000
-                else -> 2_000_000
-            }.coerceAtMost(maxBitrate).coerceAtLeast(900_000)
+                width >= 1920 && fps >= 60 -> 4_000_000
+                width >= 1920 -> 3_200_000
+                width >= 1280 && fps >= 30 -> 1_900_000
+                width >= 1280 -> 1_650_000
+                width >= 960 -> 1_350_000
+                width >= 848 -> 1_150_000
+                else -> 900_000
+            }.coerceAtMost(maxBitrate).coerceAtLeast(700_000)
             baseBitrate = bitrate
             currentBitrate = bitrate
             broadcaster.setTargetVideoBitrate(bitrate)

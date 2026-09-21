@@ -110,3 +110,22 @@ Semua bersifat tambahan; tidak ada file/fitur yang dihapus.
 - **Audio senyap sebagai cadangan**: bila audio internal tidak tersedia (izin ditolak, HP tidak mendukung, library MP3 native tidak bisa dimuat di ABI HP itu), video tetap tayang dan STB tetap menerima audio (frame MP3 senyap) sehingga tidak menunggu lalu buffering. `AudioRecord.read` yang error tidak lagi memutar CPU 100%.
 - **Renderer HTTP/1.0** (lama) dilayani tanpa chunked.
 - Tombol **Autostart / hemat daya** khusus merek (Xiaomi/Redmi/POCO, Oppo/Realme/OnePlus, Vivo/iQOO, Huawei/Honor, Samsung, Asus); bila layar merek tidak ditemukan, jatuh ke pengaturan baterai standar Android.
+
+
+## Update 1.3.0 (mirror + playlist dalam satu APK)
+- Menambahkan mode **Playlist DLNA • tanpa mirror** di aplikasi yang sama. URL M3U/M3U8 dapat dimuat, item disimpan lokal, lalu setiap item dapat ditekan untuk dikirim langsung ke renderer melalui UPnP AVTransport.
+- Menambahkan tombol **Stop TV** untuk playback DLNA langsung.
+- Parser playlist menerima `#EXTM3U/#EXTINF`, `group-title`, `tvg-logo`, URL absolut dan URL relatif. Maksimum 2.000 item disimpan.
+- Jalur mirror diperketat ke **live edge**: antrean klien dipendekkan, audio/video lama dibuang saat resync, pacing socket dibuat halus (bukan burst 2,5×), dan thread penulis rekaman diturunkan prioritasnya agar aplikasi foreground berat tidak berebut CPU/I/O.
+- PCR MPEG-TS disejajarkan dengan PTS video (tidak lagi sengaja tertinggal 180 ms).
+- Fallback audio lebih luas: 48/44,1/32 kHz dan stereo/mono, serta header frame MP3 senyap diperbaiki agar indeks sample-rate tidak tertukar.
+
+**Catatan kompatibilitas:** playlist direct-cast tidak mentranscode. A01 harus mendukung format/codec URL tersebut. Android playback capture juga tetap mengikuti kebijakan aplikasi sumber; Android mendokumentasikan bahwa hanya audio dengan usage tertentu dan capture policy yang mengizinkan yang dapat ditangkap.
+
+## Update 1.4.0 — live-edge + dua mode dalam satu APK
+- Mirror layar + audio tetap memakai pipeline MediaProjection → hardware H.264 → MPEG-TS → HTTP/DLNA.
+- Jalur live sekarang dipace terus-menerus, bukan burst saat antrean sedang kosong, dan audio yang sudah terlalu jauh tertinggal dari video dibuang agar sinkronisasi renderer lebih stabil.
+- Mode **Mirror saja** ditambahkan sebagai jalur paling ringan; rekaman tidak dibuka sehingga CPU/I/O storage lebih longgar saat memakai YouTube, game, browser, atau aplikasi berat.
+- Mode **Playlist DLNA tanpa mirror** tetap satu APK yang sama: M3U/M3U8 dimuat, disimpan sebagai cache, item dapat ditekan satu per satu, dan URL dikirim langsung ke DMR.
+- Tombol **Stop TV / Playlist** menghentikan pemutaran langsung tanpa menyentuh sesi screen-mirroring.
+- Tidak ada file project lama yang dihapus; perubahan hanya menambah kemampuan dan memperketat jalur live.

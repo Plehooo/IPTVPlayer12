@@ -261,6 +261,61 @@ object DlnaController {
         )
     }
 
+    /**
+     * Cast media/playlist item directly to the DMR without MediaProjection. This is intentionally
+     * separate from live mirror: the STB fetches the public HTTP(S) URL itself.
+     */
+    fun playDirect(renderer: Renderer, mediaUrl: String, title: String = "Media"): Result<Unit> {
+        if (renderer.avTransportControlUrl.isBlank()) {
+            return Result.failure(IllegalStateException("AVTransport tidak tersedia"))
+        }
+        if (!mediaUrl.startsWith("http://") && !mediaUrl.startsWith("https://")) {
+            return Result.failure(IllegalArgumentException("URL media tidak valid"))
+        }
+
+        val serviceTypes = linkedSetOf<String>().apply {
+            add(renderer.avTransportServiceType.ifBlank { AV_TYPE_DEFAULT })
+            add(AV_TYPE_DEFAULT)
+        }
+        val metadataAttempts = listOf(directDidlMetadata(mediaUrl, title), "")
+        var lastError: Throwable? = null
+
+        for (serviceType in serviceTypes) {
+            for (metadata in metadataAttempts) {
+                try {
+                    bestEffortStop(renderer.avTransportControlUrl, serviceType)
+                    Thread.sleep(100)
+                    soap(
+                        renderer.avTransportControlUrl,
+                        serviceType,
+                        "SetAVTransportURI",
+                        "<InstanceID>0</InstanceID>" +
+                            "<CurrentURI>${xml(mediaUrl)}</CurrentURI>" +
+                            "<CurrentURIMetaData>${xml(metadata)}</CurrentURIMetaData>"
+                    )
+                    // A01 firmware needs a short hand-off here, but not the long buffering window used
+                    // by older DLNA apps.
+                    Thread.sleep(150)
+                    soap(
+                        renderer.avTransportControlUrl,
+                        serviceType,
+                        "Play",
+                        "<InstanceID>0</InstanceID><Speed>1</Speed>"
+                    )
+                    lastTransportState = transportState(renderer, serviceType)
+                    return Result.success(Unit)
+                } catch (t: Throwable) {
+                    lastError = t
+                }
+            }
+        }
+        return Result.failure(
+            IllegalStateException(
+                "Gagal memainkan media di ${renderer.name}: ${lastError?.message ?: "renderer menolak URL"}"
+            )
+        )
+    }
+
     fun stop(renderer: Renderer) {
         val serviceTypes = linkedSetOf<String>().apply {
             add(renderer.avTransportServiceType)
@@ -963,6 +1018,29 @@ object DlnaController {
         } finally {
             connection.disconnect()
         }
+    }
+
+    private fun directDidlMetadata(url: String, title: String): String {
+        val mime = when {
+            url.contains(".m3u8", true) -> "application/vnd.apple.mpegurl"
+            url.contains(".mpd", true) -> "application/dash+xml"
+            url.contains(".mp4", true) -> "video/mp4"
+            url.contains(".mkv", true) -> "video/x-matroska"
+            url.contains(".webm", true) -> "video/webm"
+            url.contains(".mp3", true) -> "audio/mpeg"
+            url.contains(".aac", true) -> "audio/aac"
+            url.contains(".jpg", true) || url.contains(".jpeg", true) -> "image/jpeg"
+            else -> "video/mpeg"
+        }
+        val protocolInfo = "http-get:*:$mime:*"
+        return "<DIDL-Lite xmlns:dc=\"http://purl.org/dc/elements/1.1/\" " +
+            "xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\" " +
+            "xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\">" +
+            "<item id=\"1\" parentID=\"0\" restricted=\"1\">" +
+            "<dc:title>${xml(title.ifBlank { "Media" })}</dc:title>" +
+            "<upnp:class>${if (mime.startsWith("audio/")) "object.item.audioItem.musicTrack" else "object.item.videoItem"}</upnp:class>" +
+            "<res protocolInfo=\"${xml(protocolInfo)}\">${xml(url)}</res>" +
+            "</item></DIDL-Lite>"
     }
 
     /** Metadata satu baris, persis seperti metadata_for() di tar v6 (tanpa DLNA.ORG_PN). */

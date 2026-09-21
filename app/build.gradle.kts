@@ -10,8 +10,8 @@ android {
         applicationId = "com.a01mirror.dlna"
         minSdk = 29
         targetSdk = 35
-        versionCode = 3
-        versionName = "1.2.0"
+        versionCode = 5
+        versionName = "1.4.0"
     }
 
     buildTypes {
