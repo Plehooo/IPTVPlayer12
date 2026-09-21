@@ -168,10 +168,11 @@ Tidak ada file/fitur yang dihapus dan struktur kelas tidak berubah; semua bersif
 - Thread pengirim tidur/bangun (park/unpark) saat idle, bukan polling.
 
 
-## Update 1.8.0 — physical display OFF (best-effort privileged path)
-- Tidak menghapus atau mengganti pipeline mirror yang sudah ada. Jalur `MediaProjection → VirtualDisplay → H.264 → MPEG-TS → DLNA/HTTP` tetap dipakai.
-- Menambahkan `ScreenPowerController.kt` sebagai jalur tambahan yang **opt-in**. Ketika mirror sudah berjalan, tombol **Layar HP OFF • ROOT / privileged** mencoba `cmd display power-off 0` melalui root shell.
-- Saat mode aktif, controller memantau `SCREEN_ON` lalu mengirim ulang power-off setelah tombol POWER fisik menyalakan display (best effort), tanpa loop shell 4× per detik.
-- Saat service dihentikan, controller mencoba mengembalikan display dengan `cmd display power-on 0`.
-- Pada Android 15+, perintah `cmd display power-off 0` merupakan jalur shell yang tersedia untuk kontrol power display; kemampuan mempertahankan capture setelah display benar-benar OFF tetap bergantung pada ROM/perangkat.
-- Tanpa root/privileged shell, aplikasi biasa tidak memiliki hak untuk melakukan operasi tersebut; `MediaProjection` publik tidak menyediakan API pengganti untuk memaksa physical display tetap OFF sambil tetap meng-capture layar.
+## Update 1.9.0 — screen blackout tanpa root
+- Pipeline mirror lama tetap dipakai: `MediaProjection → VirtualDisplay → H.264 → MPEG-TS → DLNA/HTTP`.
+- `ScreenPowerController.kt` sekarang **tidak menjalankan `su`, `cmd display`, atau shell privileged**. Mode layar gelap memakai kontrol brightness sistem minimum + wake lock layar agar MediaProjection tetap aktif.
+- Android mewajibkan izin khusus `WRITE_SETTINGS` untuk aplikasi yang ingin mengubah `Settings.System.SCREEN_BRIGHTNESS`; aplikasi membuka halaman izin ini otomatis saat pertama kali tombol dipakai.
+- Controller menyimpan brightness + mode auto/manual sebelum dimatikan dan mengembalikannya saat mode berhenti.
+- `ACTION_SCREEN_OFF` dan `ACTION_SCREEN_ON` dipantau melalui receiver runtime. Jika tombol POWER fisik membuat perangkat non-interaktif, controller melakukan wake-up singkat dan mengulang brightness minimum secara best-effort.
+- Ini adalah **blackout tanpa root**: panel dijaga tetap aktif tetapi backlight dipaksa ke minimum supaya tampak mati sementara frame MediaProjection tetap hidup. Android tidak memberikan aplikasi biasa API publik untuk melakukan physical-display power-off seperti shell `cmd display power-off`.
+

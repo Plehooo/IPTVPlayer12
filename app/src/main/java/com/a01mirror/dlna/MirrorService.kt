@@ -78,6 +78,7 @@ class MirrorService : Service() {
         // Penting: SOAP Play/Stop dan penghitungan IP HP di service harus diikat ke jaringan Wi-Fi
         // (sebelumnya konteks ini hanya diset di MainActivity sehingga service memakai jaringan default).
         DlnaController.setDiscoveryContext(this)
+        ScreenPowerController.recoverStaleState(this)
         ensureChannel()
     }
 
@@ -95,11 +96,7 @@ class MirrorService : Service() {
                 if (screenPowerController == null) {
                     screenPowerController = ScreenPowerController(this) { message ->
                         statusLine = message
-                        if (message.contains("aktif", ignoreCase = true)) {
-                            screenOffActive = true
-                        } else if (message.contains("dimatikan", ignoreCase = true)) {
-                            screenOffActive = false
-                        }
+                        screenOffActive = message.contains("Mode layar gelap aktif", ignoreCase = true)
                     }
                 }
                 screenOffActive = screenPowerController?.start() == true
@@ -254,6 +251,7 @@ class MirrorService : Service() {
         running = false
         activeBroadcaster = null
         try { screenPowerController?.stop(restoreScreen = true) } catch (_: Throwable) {}
+        try { screenPowerController?.shutdown() } catch (_: Throwable) {}
         screenPowerController = null
         screenOffActive = false
         mainHandler.removeCallbacks(ticker)

@@ -99,6 +99,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         DlnaController.setDiscoveryContext(this)
+        ScreenPowerController.recoverStaleState(this)
         buildUi()
         status.text = "Siap. Sambungkan HP dan STP-A01 ke Wi-Fi yang sama."
         refreshLive()
@@ -412,11 +413,10 @@ class MainActivity : Activity() {
         }
         controlCard.addView(stopButton, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
 
-        // Mode privileged tambahan: jika HP rooted / privileged shell tersedia,
-        // Android 15+ dapat mematikan physical display tanpa memutus mirror.
+        // Mode blackout tanpa root: layar dibuat sangat gelap sambil menjaga sesi MediaProjection aktif.
         controlCard.addView(
-            styledButton("▣  Layar HP OFF • ROOT / privileged", C_ACCENT, outline = true) {
-                togglePrivilegedScreenOff()
+            styledButton("▣  Layar HP OFF • TANPA ROOT", C_ACCENT, outline = true) {
+                toggleScreenBlackout()
             },
             LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) }
         )
@@ -464,7 +464,7 @@ class MainActivity : Activity() {
         }
 
         val note = TextView(this).apply {
-            text = "Catatan: DLNA STP-A01 bukan receiver Miracast. Satu APK ini punya 2 mode: mirror layar + audio " +
+            text = "Catatan: mode 'Layar HP OFF' pada APK tanpa root bekerja sebagai blackout/backlight minimum agar MediaProjection tetap aktif; Android tidak memberi aplikasi biasa hak untuk mematikan physical display secara privileged. DLNA STP-A01 bukan receiver Miracast. Satu APK ini punya 2 mode: mirror layar + audio " +
                 "dan playlist yang dikirim langsung ke TV tanpa mirror. Untuk mirror, set baterai aplikasi ini ke " +
                 "\"Tanpa batasan\" (tombol Izin baterai) agar service tidak dibatasi saat membuka aplikasi berat. " +
                 "Playback playlist tetap bergantung format yang didukung firmware STP-A01."
@@ -520,12 +520,34 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun togglePrivilegedScreenOff() {
+    private fun toggleScreenBlackout() {
         if (!MirrorService.running) {
             Toast.makeText(this, "Mulai mirror dulu.", Toast.LENGTH_SHORT).show()
             return
         }
+
         val wasActive = MirrorService.screenOffActive
+        if (!wasActive && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.System.canWrite(this)) {
+            try {
+                val intent = Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS).apply {
+                    data = android.net.Uri.parse("package:$packageName")
+                }
+                startActivity(intent)
+                Toast.makeText(
+                    this,
+                    "Aktifkan 'Izinkan mengubah setelan sistem', lalu kembali ke A01 Mirror dan tekan tombol lagi.",
+                    Toast.LENGTH_LONG
+                ).show()
+            } catch (_: Throwable) {
+                Toast.makeText(
+                    this,
+                    "Izin brightness sistem tidak bisa dibuka di ROM ini.",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+            return
+        }
+
         val action = if (wasActive) {
             MirrorService.ACTION_SCREEN_ON_PRIVILEGED
         } else {
@@ -535,8 +557,8 @@ class MainActivity : Activity() {
             startService(Intent(this, MirrorService::class.java).setAction(action))
             Toast.makeText(
                 this,
-                if (wasActive) "Meminta layar HP menyala kembali…"
-                else "Mencoba mematikan display fisik lewat root/privileged shell…",
+                if (wasActive) "Mengembalikan brightness layar…"
+                else "Layar dibuat gelap (tanpa root); mirror tetap berjalan…",
                 Toast.LENGTH_SHORT
             ).show()
         } catch (_: Throwable) {
@@ -755,6 +777,7 @@ class MainActivity : Activity() {
                 append("Rekam  : ").append(recLine)
                 if (b.recordingGaps > 0L) append(" • celah ").append(b.recordingGaps)
                 if (b.recordingName.isNotEmpty()) append("\nFile   : ").append(b.recordingName)
+                if (MirrorService.screenOffActive) append("\nLayar  : GELAP • tanpa root")
             }
         } else {
             lastBytesMs = 0L
