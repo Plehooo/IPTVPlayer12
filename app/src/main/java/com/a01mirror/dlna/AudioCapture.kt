@@ -60,19 +60,29 @@ class AudioCapture(
 
         if (ar == null) {
             onFailure(IllegalStateException("Audio internal tidak tersedia di perangkat ini."))
+            startSilence()
             return
         }
 
         sampleRate = selectedRate
         channels = 2
         record = ar
-        lame = LameBuilder()
+        lame = try {
+            LameBuilder()
             .setInSampleRate(sampleRate)
             .setOutChannels(channels)
             .setOutBitrate(96)
             .setOutSampleRate(sampleRate)
             .setQuality(7)
             .build()
+        } catch (t: Throwable) {
+            // Library MP3 native tidak bisa dimuat di ABI HP ini: tetap siarkan video + audio senyap.
+            try { record?.release() } catch (_: Exception) {}
+            record = null
+            onFailure(t)
+            startSilence()
+            return
+        }
 
         running = true
         thread = Thread { loop() }.also { it.name = "A01-Audio"; it.start() }
@@ -98,6 +108,7 @@ class AudioCapture(
         val pcm = ShortArray(framesPerRead * channels)
         val mp3 = ByteArray(7200 + pcm.size * 2)
         var samplesPerChannel = 0L
+        var lastPts90k = 0L
 
         try {
             // Audio tidak boleh tersendat walau game/aplikasi berat sedang memakai CPU.
@@ -107,13 +118,18 @@ class AudioCapture(
             val anchor90k = (System.nanoTime() - broadcaster.clockOriginNs).coerceAtLeast(0L) * 9L / 100_000L
             while (running) {
                 val shorts = rec.read(pcm, 0, pcm.size, AudioRecord.READ_BLOCKING)
-                if (shorts <= 0) continue
+                if (shorts < 0) throw IllegalStateException("AudioRecord.read gagal ($shorts)")
+                if (shorts == 0) {
+                    Thread.sleep(5)
+                    continue
+                }
                 val perChannel = shorts / channels
                 val encoded = enc.encodeBufferInterLeaved(pcm, perChannel, mp3)
                 if (encoded > 0) {
                     val bytes = mp3.copyOf(encoded)
                     val pts = anchor90k + samplesPerChannel * 90000L / sampleRate
                     broadcaster.publishAudio(bytes, pts)
+                    lastPts90k = pts
                 }
                 samplesPerChannel += perChannel
             }
@@ -122,8 +138,48 @@ class AudioCapture(
                 broadcaster.publishAudio(mp3.copyOf(flushed), anchor90k + samplesPerChannel * 90000L / sampleRate)
             }
         } catch (t: Throwable) {
-            if (running) onFailure(t)
+            if (running) {
+                onFailure(t)
+                // Jangan biarkan STB menunggu audio yang berhenti (penyebab buffering): lanjut audio senyap.
+                silenceLoop(lastPts90k + 2160L)
+            }
         }
+    }
+
+    private fun startSilence() {
+        running = true
+        thread = Thread { silenceLoop(0L) }.also { it.name = "A01-AudioSilence"; it.start() }
+    }
+
+    /**
+     * Cadangan bila audio internal tidak tersedia (izin ditolak, HP tidak mendukung, library MP3 gagal).
+     * Mengirim frame MP3 senyap secara real-time supaya STB tidak menunggu audio lalu buffering.
+     */
+    private fun silenceLoop(minPts90k: Long) {
+        try { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO) } catch (_: Throwable) {}
+        val frame = silentFrame(sampleRate)
+        val startNs = System.nanoTime()
+        val anchor90k = maxOf((startNs - broadcaster.clockOriginNs).coerceAtLeast(0L) * 9L / 100_000L, minPts90k)
+        var samples = 0L
+        try {
+            while (running) {
+                broadcaster.publishAudio(frame, anchor90k + samples * 90000L / sampleRate)
+                samples += 1152L
+                val waitNs = startNs + samples * 1_000_000_000L / sampleRate - System.nanoTime()
+                if (waitNs > 0L) Thread.sleep(waitNs / 1_000_000L, (waitNs % 1_000_000L).toInt())
+            }
+        } catch (_: InterruptedException) {
+        }
+    }
+
+    /** Satu frame MPEG-1 Layer III berisi nol (side info nol = keluaran senyap), 96 kbps stereo. */
+    private fun silentFrame(rate: Int): ByteArray {
+        val rateIndex = if (rate == 44100) 0 else 1
+        val frame = ByteArray(144 * 96000 / rate)
+        frame[0] = 0xFF.toByte()
+        frame[1] = 0xFB.toByte()
+        frame[2] = ((7 shl 4) or (rateIndex shl 2)).toByte()
+        return frame
     }
 }
 

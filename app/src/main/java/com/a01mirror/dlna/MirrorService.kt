@@ -22,6 +22,8 @@ class MirrorService : Service() {
         const val EXTRA_WIDTH = "width"
         const val EXTRA_HEIGHT = "height"
         const val EXTRA_FPS = "fps"
+        const val EXTRA_AUTO_SIZE = "auto_size"
+        const val EXTRA_AUTO_FPS = "auto_fps"
         const val EXTRA_RENDERER_LOCATION = "renderer_location"
         const val EXTRA_RENDERER_CONTROL_URL = "renderer_control_url"
         const val EXTRA_RENDERER_SERVICE_TYPE = "renderer_service_type"
@@ -87,9 +89,17 @@ class MirrorService : Service() {
             val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, 0) ?: 0
             val data = intent?.getParcelableExtraCompat<Intent>(EXTRA_RESULT_DATA)
                 ?: throw IllegalArgumentException("Data MediaProjection hilang")
-            val width = intent.getIntExtra(EXTRA_WIDTH, 1280)
-            val height = intent.getIntExtra(EXTRA_HEIGHT, 720)
-            val fps = intent.getIntExtra(EXTRA_FPS, 30)
+            // Mode "Otomatis": awal dari kelas HP; lalu SEMUA pilihan disesuaikan ke kemampuan encoder
+            // HP ini (fps turun dulu, baru resolusi) agar berjalan di HP apa pun tanpa buffering.
+            val auto = H264Encoder.autoRequest(this)
+            val requestedWidth = if (intent.getBooleanExtra(EXTRA_AUTO_SIZE, false)) auto[0] else intent.getIntExtra(EXTRA_WIDTH, 1280)
+            val requestedHeight = if (intent.getBooleanExtra(EXTRA_AUTO_SIZE, false)) auto[1] else intent.getIntExtra(EXTRA_HEIGHT, 720)
+            val requestedFps = if (intent.getBooleanExtra(EXTRA_AUTO_FPS, false)) auto[2] else intent.getIntExtra(EXTRA_FPS, 30)
+            val fit = H264Encoder.fitToDevice(requestedWidth, requestedHeight, requestedFps)
+            val width = fit.width
+            val height = fit.height
+            val fps = fit.fps
+            val fitNote = fit.note
             val name = intent.getStringExtra(EXTRA_RENDERER_NAME) ?: "DLNA Renderer"
             val location = intent.getStringExtra(EXTRA_RENDERER_LOCATION) ?: ""
             val control = intent.getStringExtra(EXTRA_RENDERER_CONTROL_URL) ?: ""
@@ -129,6 +139,7 @@ class MirrorService : Service() {
                 fps = fps,
                 densityDpi = resources.configuration.densityDpi,
                 broadcaster = stream,
+                maxBitrate = wifiBitrateCap(),
                 onFailure = {
                     postError("Video: ${it.message ?: "gagal"}")
                     stopSelf()
@@ -138,7 +149,9 @@ class MirrorService : Service() {
             audio = AudioCapture(
                 projection = projection!!,
                 broadcaster = stream,
-                onFailure = { postError("Audio internal: ${it.message ?: "tidak tersedia"}") }
+                onFailure = {
+                    postError("Audio internal tidak tersedia (${it.message ?: "tidak didukung"}). Video tetap tayang, audio senyap.")
+                }
             ).also { it.start() }
 
             running = true
@@ -160,7 +173,8 @@ class MirrorService : Service() {
                         val result = DlnaController.playLive(r, streamUrl, "${width}x${height}")
                         if (result.isSuccess) {
                             val state = DlnaController.lastTransportState
-                            statusLine = "Tayang ke ${r.name}" + (if (state.isNotBlank()) " ($state)" else "")
+                            statusLine = "Tayang ke ${r.name}" + (if (state.isNotBlank()) " ($state)" else "") +
+                                " • ${width}×${height}@${fps}fps" + (if (fitNote.isNotEmpty()) "\n$fitNote" else "")
                         } else {
                             postError(result.exceptionOrNull()?.message ?: "DLNA gagal")
                         }
@@ -362,6 +376,21 @@ class MirrorService : Service() {
                 .build()
             getSystemService(NotificationManager::class.java).notify(ERROR_NOTIFICATION_ID, notification)
         } catch (_: Exception) {
+        }
+    }
+
+    /**
+     * Batas bitrate awal dari kecepatan link Wi-Fi HP (bila terbaca). Link lambat = bitrate awal lebih
+     * rendah, jadi STB tidak langsung kebanjiran data dan buffering. Mode hotspot/tidak terbaca = tanpa batas.
+     */
+    @Suppress("DEPRECATION")
+    private fun wifiBitrateCap(): Int {
+        return try {
+            val manager = applicationContext.getSystemService(android.net.wifi.WifiManager::class.java)
+            val link = manager.connectionInfo?.linkSpeed ?: -1
+            if (link <= 0) Int.MAX_VALUE else (link * 200_000).coerceIn(1_500_000, 8_000_000)
+        } catch (_: Throwable) {
+            Int.MAX_VALUE
         }
     }
 

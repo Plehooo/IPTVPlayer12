@@ -243,7 +243,7 @@ class TsBroadcaster(
     }
 
     @Synchronized
-    fun attach(socket: Socket, outputStream: OutputStream) {
+    fun attach(socket: Socket, outputStream: OutputStream, chunked: Boolean = true) {
         try {
             socket.tcpNoDelay = true
             socket.keepAlive = true
@@ -257,7 +257,8 @@ class TsBroadcaster(
             outputStream,
             { targetVideoBitrate + TARGET_AUDIO_BITRATE },
             { droppedClientPackets += 1L },
-            { requestKeyFrame() }
+            { requestKeyFrame() },
+            chunked
         )
         try {
             // Tidak ada penulisan socket di sini (dulu memblokir lock broadcaster dan menahan encoder).
@@ -349,7 +350,8 @@ class TsBroadcaster(
         outputStream: OutputStream,
         private val bitrateProvider: () -> Long,
         private val onDrop: () -> Unit,
-        private val onNeedKey: () -> Unit
+        private val onNeedKey: () -> Unit,
+        private val chunked: Boolean = true
     ) {
         private val output: OutputStream = BufferedOutputStream(outputStream, 32 * 1024)
 
@@ -500,6 +502,11 @@ class TsBroadcaster(
         }
 
         private fun writeChunked(packet: ByteArray, offset: Int, len: Int) {
+            if (!chunked) {
+                // Renderer HTTP/1.0: aliran mentah tanpa framing chunked.
+                output.write(packet, offset, len)
+                return
+            }
             val head = (Integer.toHexString(len) + "\r\n").toByteArray(StandardCharsets.US_ASCII)
             output.write(head)
             output.write(packet, offset, len)
@@ -583,6 +590,7 @@ class LiveHttpServer(
                 val method = parts.getOrNull(0)?.uppercase(Locale.US) ?: ""
                 val requestedPath = parts.getOrNull(1)?.substringBefore('?') ?: ""
                 val expectedPath = "/a01/$token/stream.ts"
+                val http10 = parts.getOrNull(2)?.trim().equals("HTTP/1.0", ignoreCase = true)
                 val output = socket.getOutputStream()
 
                 if (method != "GET" && method != "HEAD") {
@@ -600,12 +608,12 @@ class LiveHttpServer(
                 // Match the working A01 v6 Termux server: chunked HTTP live stream,
                 // no-cache, Streaming transfer mode, and Connection: close semantics.
                 val header = buildString {
-                    append("HTTP/1.1 200 OK\r\n")
+                    append(if (http10) "HTTP/1.0 200 OK\r\n" else "HTTP/1.1 200 OK\r\n")
                     append("Content-Type: video/mpeg\r\n")
                     append("Cache-Control: no-cache, no-store, must-revalidate\r\n")
                     append("Pragma: no-cache\r\n")
                     append("Connection: close\r\n")
-                    append("Transfer-Encoding: chunked\r\n")
+                    if (!http10) append("Transfer-Encoding: chunked\r\n")
                     append("transferMode.dlna.org: Streaming\r\n")
                     append("contentFeatures.dlna.org: ").append(DlnaController.DLNA_FEATURES).append("\r\n")
                     append("\r\n")
@@ -618,7 +626,7 @@ class LiveHttpServer(
                     return@Thread
                 }
 
-                broadcaster.attach(socket, output)
+                broadcaster.attach(socket, output, !http10)
                 while (running && !socket.isClosed) {
                     Thread.sleep(1000)
                 }

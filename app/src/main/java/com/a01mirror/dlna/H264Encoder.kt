@@ -1,5 +1,7 @@
 package com.a01mirror.dlna
 
+import android.app.ActivityManager
+import android.content.Context
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.MediaCodec
@@ -19,8 +21,13 @@ class H264Encoder(
     private val fps: Int,
     private val densityDpi: Int,
     private val broadcaster: TsBroadcaster,
-    private val onFailure: (Throwable) -> Unit
+    private val onFailure: (Throwable) -> Unit,
+    // Batas atas bitrate (mis. dari kecepatan link Wi-Fi). Nilai default = tanpa batas tambahan.
+    private val maxBitrate: Int = Int.MAX_VALUE
 ) {
+    /** Hasil penyesuaian permintaan resolusi/fps ke kemampuan encoder HP ini. */
+    class Fit(val width: Int, val height: Int, val fps: Int, val note: String)
+
     private var codec: MediaCodec? = null
     private var inputSurface: android.view.Surface? = null
     private var virtualDisplay: VirtualDisplay? = null
@@ -42,6 +49,109 @@ class H264Encoder(
     private var anchorNs = 0L
     private var lastVideoPts90k = -1L
     private val aud = byteArrayOf(0, 0, 0, 1, 0x09, 0xF0.toByte())
+
+    companion object {
+        private val SIZE_LADDER = arrayOf(
+            intArrayOf(1920, 1080),
+            intArrayOf(1280, 720),
+            intArrayOf(960, 540),
+            intArrayOf(848, 480),
+            intArrayOf(640, 360),
+            intArrayOf(512, 288)
+        )
+        private val FPS_LADDER = intArrayOf(60, 30, 25, 24, 20, 15)
+
+        /**
+         * Permintaan "Otomatis": pilih resolusi/fps awal dari kelas HP (RAM, jumlah inti CPU,
+         * media performance class). Selalu konservatif agar STB tidak buffering di HP mana pun.
+         * Hasil: [lebar, tinggi, fps].
+         */
+        fun autoRequest(context: Context): IntArray {
+            var ramGb = 4.0
+            var lowRam = false
+            try {
+                val am = context.getSystemService(ActivityManager::class.java)
+                val info = ActivityManager.MemoryInfo()
+                am.getMemoryInfo(info)
+                ramGb = info.totalMem / 1073741824.0
+                lowRam = am.isLowRamDevice
+            } catch (_: Throwable) {
+            }
+            val cores = Runtime.getRuntime().availableProcessors()
+            val perfClass = if (Build.VERSION.SDK_INT >= 31) Build.VERSION.MEDIA_PERFORMANCE_CLASS else 0
+            return when {
+                lowRam || ramGb < 2.2 -> intArrayOf(848, 480, 25)
+                ramGb < 3.2 || cores < 6 -> intArrayOf(960, 540, 25)
+                perfClass >= 31 || (ramGb >= 5.0 && cores >= 8) -> intArrayOf(1280, 720, 30)
+                else -> intArrayOf(1280, 720, 25)
+            }
+        }
+
+        /**
+         * Turunkan fps dulu (jaga ketajaman teks), baru resolusi, sampai kombinasi didukung encoder
+         * hardware HP ini. Tidak ada angka yang dikunci ke satu merek/tipe HP.
+         */
+        fun fitToDevice(width: Int, height: Int, fps: Int): Fit {
+            var video: MediaCodecInfo.VideoCapabilities? = null
+            try {
+                val infos = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
+                    .filter { it.isEncoder && it.supportedTypes.any { t -> t.equals(MediaFormat.MIMETYPE_VIDEO_AVC, true) } }
+                    .sortedWith(
+                        compareBy<MediaCodecInfo> { !runCatching { it.isHardwareAccelerated }.getOrDefault(false) }
+                            .thenBy { runCatching { !it.isVendor }.getOrDefault(true) }
+                            .thenBy { it.name.contains("google", ignoreCase = true) }
+                    )
+                for (info in infos) {
+                    val caps = try {
+                        info.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
+                    } catch (_: Throwable) {
+                        null
+                    } ?: continue
+                    if (!caps.colorFormats.contains(MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)) continue
+                    video = caps.videoCapabilities
+                    break
+                }
+            } catch (_: Throwable) {
+            }
+            val caps = video ?: return Fit(width, height, fps, "")
+
+            val requestedPixels = width.toLong() * height.toLong()
+            val sizes = ArrayList<IntArray>()
+            sizes.add(intArrayOf(width, height))
+            for (s in SIZE_LADDER) {
+                if (s[0].toLong() * s[1].toLong() < requestedPixels) sizes.add(s)
+            }
+            val rates = ArrayList<Int>()
+            rates.add(fps)
+            for (f in FPS_LADDER) if (f < fps) rates.add(f)
+
+            // Putaran 1 menjaga fps >= 24; putaran 2 (darurat) menerima fps berapa pun.
+            for (minFps in intArrayOf(24, 1)) {
+                for (s in sizes) {
+                    for (f in rates) {
+                        if (f < minFps) continue
+                        if (fits(caps, s[0], s[1], f)) {
+                            val same = s[0] == width && s[1] == height && f == fps
+                            val note = if (same) "" else
+                                "Disesuaikan ke ${s[0]}×${s[1]}@${f}fps (HP ini tidak sanggup ${width}×${height}@${fps}fps)."
+                            return Fit(s[0], s[1], f, note)
+                        }
+                    }
+                }
+            }
+            return Fit(width, height, fps, "")
+        }
+
+        private fun fits(caps: MediaCodecInfo.VideoCapabilities, w: Int, h: Int, f: Int): Boolean {
+            try {
+                if (!caps.areSizeAndRateSupported(w, h, f.toDouble())) return false
+                val achievable = try { caps.getAchievableFrameRatesFor(w, h) } catch (_: Throwable) { null }
+                return achievable == null || achievable.upper >= f * 0.85
+            } catch (_: Throwable) {
+                return true
+            }
+        }
+    }
 
     @Synchronized
     fun start() {
@@ -94,7 +204,7 @@ class H264Encoder(
                 fps >= 60 -> 3_000_000
                 fps >= 30 -> 2_400_000
                 else -> 2_000_000
-            }
+            }.coerceAtMost(maxBitrate).coerceAtLeast(900_000)
             baseBitrate = bitrate
             currentBitrate = bitrate
             broadcaster.setTargetVideoBitrate(bitrate)

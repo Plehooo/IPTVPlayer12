@@ -100,3 +100,13 @@ Struktur file/kelas tidak berubah; yang diperbaiki:
 - Capture audio kini juga menangkap `USAGE_UNKNOWN`.
 
 Untuk Redmi/HyperOS: buka **Izin baterai** dan set A01 Mirror ke *Tanpa batasan*; pakai 720p 25/30 fps.
+
+## Update 1.2.0 (semua HP, bukan hanya Redmi)
+
+Semua bersifat tambahan; tidak ada file/fitur yang dihapus.
+
+- **Otomatis sesuai HP** (default baru di Resolusi dan Frame rate): resolusi/fps awal dipilih dari RAM, jumlah inti CPU dan media performance class. Apa pun pilihan Anda, `H264Encoder.fitToDevice()` menurunkannya ke batas encoder hardware HP itu (fps dulu, baru resolusi) memakai `MediaCodecInfo.VideoCapabilities`.
+- **Bitrate awal mengikuti kecepatan link Wi-Fi** (bila terbaca), lalu adaptasi otomatis seperti sebelumnya. Link lambat tidak langsung membanjiri STB.
+- **Audio senyap sebagai cadangan**: bila audio internal tidak tersedia (izin ditolak, HP tidak mendukung, library MP3 native tidak bisa dimuat di ABI HP itu), video tetap tayang dan STB tetap menerima audio (frame MP3 senyap) sehingga tidak menunggu lalu buffering. `AudioRecord.read` yang error tidak lagi memutar CPU 100%.
+- **Renderer HTTP/1.0** (lama) dilayani tanpa chunked.
+- Tombol **Autostart / hemat daya** khusus merek (Xiaomi/Redmi/POCO, Oppo/Realme/OnePlus, Vivo/iQOO, Huawei/Honor, Samsung, Asus); bila layar merek tidak ditemukan, jatuh ke pengaturan baterai standar Android.

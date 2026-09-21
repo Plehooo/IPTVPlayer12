@@ -275,8 +275,9 @@ class MainActivity : Activity() {
         resolutionSpinner.adapter = ArrayAdapter(
             this,
             android.R.layout.simple_spinner_dropdown_item,
-            listOf("1280×720 (stabil, disarankan)", "1920×1080 (berat)")
+            listOf("1280×720 (stabil)", "1920×1080 (berat)", "Otomatis (sesuai HP) — disarankan")
         )
+        resolutionSpinner.setSelection(2)
         qualityCard.addView(resolutionSpinner, LinearLayout.LayoutParams(-1, -2))
 
         qualityCard.addView(label("Frame rate"))
@@ -284,9 +285,16 @@ class MainActivity : Activity() {
         fpsSpinner.adapter = ArrayAdapter(
             this,
             android.R.layout.simple_spinner_dropdown_item,
-            listOf("25 fps (sesuai STB T2, paling stabil)", "30 fps", "60 fps (uji perangkat)")
+            listOf("25 fps (sesuai STB T2, paling stabil)", "30 fps", "60 fps (uji perangkat)", "Otomatis (sesuai HP) — disarankan")
         )
+        fpsSpinner.setSelection(3)
         qualityCard.addView(fpsSpinner, LinearLayout.LayoutParams(-1, -2))
+        qualityCard.addView(TextView(this).apply {
+            text = "Pilihan apa pun otomatis diturunkan ke batas kemampuan encoder HP ini (fps dulu, lalu resolusi)."
+            textSize = 11.5f
+            setTextColor(C_MUTED)
+            setPadding(0, dp(8), 0, 0)
+        })
 
         // ---- Kartu 3: kontrol ----
         val controlCard = addCard(root, "Kontrol")
@@ -332,6 +340,14 @@ class MainActivity : Activity() {
         )
         statusCard.addView(tools, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
 
+        // Merek tertentu (Xiaomi/Oppo/Vivo/Huawei/Samsung/Asus) punya "autostart"/hemat daya sendiri yang mematikan service.
+        if (vendorAutostartIntent() != null) {
+            statusCard.addView(
+                styledButton("Autostart / hemat daya ${Build.MANUFACTURER}", C_ACCENT, outline = true) { openAutostartSettings() },
+                LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) }
+            )
+        }
+
         val note = TextView(this).apply {
             text = "Catatan: DLNA STP-A01 bukan receiver Miracast. Aplikasi ini mengirim live H.264 + MP3 " +
                 "melalui HTTP/DLNA. Agar tidak tersendat saat membuka aplikasi berat, set baterai aplikasi ini " +
@@ -356,6 +372,36 @@ class MainActivity : Activity() {
         }
         setContentView(scroll)
         scroll.requestApplyInsets()
+    }
+
+    private fun vendorAutostartIntent(): Intent? {
+        val maker = Build.MANUFACTURER.lowercase(Locale.US)
+        val target: Pair<String, String>? = when {
+            maker.contains("xiaomi") || maker.contains("redmi") || maker.contains("poco") ->
+                "com.miui.securitycenter" to "com.miui.permcenter.autostart.AutoStartManagementActivity"
+            maker.contains("oppo") || maker.contains("realme") || maker.contains("oneplus") ->
+                "com.coloros.safecenter" to "com.coloros.safecenter.permission.startup.StartupAppListActivity"
+            maker.contains("vivo") || maker.contains("iqoo") ->
+                "com.vivo.permissionmanager" to "com.vivo.permissionmanager.activity.BgStartUpManagerActivity"
+            maker.contains("huawei") || maker.contains("honor") ->
+                "com.huawei.systemmanager" to "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity"
+            maker.contains("samsung") ->
+                "com.samsung.android.lool" to "com.samsung.android.sm.ui.battery.BatteryActivity"
+            maker.contains("asus") ->
+                "com.asus.mobilemanager" to "com.asus.mobilemanager.autostart.AutoStartActivity"
+            else -> null
+        }
+        return target?.let { Intent().setClassName(it.first, it.second) }
+    }
+
+    private fun openAutostartSettings() {
+        try {
+            val intent = vendorAutostartIntent() ?: throw IllegalStateException("tidak ada")
+            startActivity(intent)
+        } catch (_: Exception) {
+            // Nama layar tiap versi OS berbeda; jatuhkan ke daftar optimasi baterai standar Android.
+            openBatterySettings()
+        }
     }
 
     private fun openBatterySettings() {
@@ -509,6 +555,8 @@ class MainActivity : Activity() {
             putExtra(MirrorService.EXTRA_WIDTH, width)
             putExtra(MirrorService.EXTRA_HEIGHT, height)
             putExtra(MirrorService.EXTRA_FPS, fps)
+            putExtra(MirrorService.EXTRA_AUTO_SIZE, resolutionSpinner.selectedItemPosition == 2)
+            putExtra(MirrorService.EXTRA_AUTO_FPS, fpsSpinner.selectedItemPosition == 3)
             putExtra(MirrorService.EXTRA_RENDERER_LOCATION, renderer.location)
             putExtra(MirrorService.EXTRA_RENDERER_CONTROL_URL, renderer.avTransportControlUrl)
             putExtra(MirrorService.EXTRA_RENDERER_SERVICE_TYPE, renderer.avTransportServiceType)
