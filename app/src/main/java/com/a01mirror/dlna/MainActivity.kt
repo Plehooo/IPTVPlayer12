@@ -412,6 +412,15 @@ class MainActivity : Activity() {
         }
         controlCard.addView(stopButton, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
 
+        // Mode privileged tambahan: jika HP rooted / privileged shell tersedia,
+        // Android 15+ dapat mematikan physical display tanpa memutus mirror.
+        controlCard.addView(
+            styledButton("▣  Layar HP OFF • ROOT / privileged", C_ACCENT, outline = true) {
+                togglePrivilegedScreenOff()
+            },
+            LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) }
+        )
+
         // ---- Kartu 4: live ----
         val liveCard = addCard(root, "Live")
         liveText = TextView(this).apply {
@@ -508,6 +517,30 @@ class MainActivity : Activity() {
         } catch (_: Exception) {
             // Nama layar tiap versi OS berbeda; jatuhkan ke daftar optimasi baterai standar Android.
             openBatterySettings()
+        }
+    }
+
+    private fun togglePrivilegedScreenOff() {
+        if (!MirrorService.running) {
+            Toast.makeText(this, "Mulai mirror dulu.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val wasActive = MirrorService.screenOffActive
+        val action = if (wasActive) {
+            MirrorService.ACTION_SCREEN_ON_PRIVILEGED
+        } else {
+            MirrorService.ACTION_SCREEN_OFF_PRIVILEGED
+        }
+        try {
+            startService(Intent(this, MirrorService::class.java).setAction(action))
+            Toast.makeText(
+                this,
+                if (wasActive) "Meminta layar HP menyala kembali…"
+                else "Mencoba mematikan display fisik lewat root/privileged shell…",
+                Toast.LENGTH_SHORT
+            ).show()
+        } catch (_: Throwable) {
+            Toast.makeText(this, "Gagal mengirim perintah ke service mirror.", Toast.LENGTH_LONG).show()
         }
     }
 

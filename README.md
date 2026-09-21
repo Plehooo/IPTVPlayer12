@@ -166,3 +166,12 @@ Tidak ada file/fitur yang dihapus dan struktur kelas tidak berubah; semua bersif
 - Antrean rekaman mengikuti heap HP (3–12 MB, bukan 16 MB tetap).
 - Playlist di-parse streaming baris demi baris (tidak lagi String 16 MB + salinan); koma di dalam atribut `#EXTINF` tidak memotong nama channel.
 - Thread pengirim tidur/bangun (park/unpark) saat idle, bukan polling.
+
+
+## Update 1.8.0 — physical display OFF (best-effort privileged path)
+- Tidak menghapus atau mengganti pipeline mirror yang sudah ada. Jalur `MediaProjection → VirtualDisplay → H.264 → MPEG-TS → DLNA/HTTP` tetap dipakai.
+- Menambahkan `ScreenPowerController.kt` sebagai jalur tambahan yang **opt-in**. Ketika mirror sudah berjalan, tombol **Layar HP OFF • ROOT / privileged** mencoba `cmd display power-off 0` melalui root shell.
+- Saat mode aktif, controller memantau `SCREEN_ON` lalu mengirim ulang power-off setelah tombol POWER fisik menyalakan display (best effort), tanpa loop shell 4× per detik.
+- Saat service dihentikan, controller mencoba mengembalikan display dengan `cmd display power-on 0`.
+- Pada Android 15+, perintah `cmd display power-off 0` merupakan jalur shell yang tersedia untuk kontrol power display; kemampuan mempertahankan capture setelah display benar-benar OFF tetap bergantung pada ROM/perangkat.
+- Tanpa root/privileged shell, aplikasi biasa tidak memiliki hak untuk melakukan operasi tersebut; `MediaProjection` publik tidak menyediakan API pengganti untuk memaksa physical display tetap OFF sambil tetap meng-capture layar.

@@ -35,12 +35,15 @@ class MirrorService : Service() {
         private const val CHANNEL_ID = "a01_mirror"
         private const val ERROR_CHANNEL_ID = "a01_mirror_error"
         private const val ACTION_STOP = "com.a01mirror.dlna.STOP"
+        const val ACTION_SCREEN_OFF_PRIVILEGED = "com.a01mirror.dlna.SCREEN_OFF_PRIVILEGED"
+        const val ACTION_SCREEN_ON_PRIVILEGED = "com.a01mirror.dlna.SCREEN_ON_PRIVILEGED"
 
         // Status yang dibaca MainActivity (service kini satu proses dengan UI, jadi bisa dibagi langsung).
         @Volatile var running: Boolean = false
         @Volatile var lastError: String = ""
         @Volatile var statusLine: String = ""
         @Volatile var activeBroadcaster: TsBroadcaster? = null
+        @Volatile var screenOffActive: Boolean = false
     }
 
     private var projection: MediaProjection? = null
@@ -54,6 +57,7 @@ class MirrorService : Service() {
     private var wifiHighPerfLock: android.net.wifi.WifiManager.WifiLock? = null
     private var cpuWakeLock: android.os.PowerManager.WakeLock? = null
     private var thermalListener: android.os.PowerManager.OnThermalStatusChangedListener? = null
+    private var screenPowerController: ScreenPowerController? = null
 
     private val mainHandler = Handler(Looper.getMainLooper())
     @Volatile private var destroyed = false
@@ -78,9 +82,34 @@ class MirrorService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) {
-            stopSelf()
-            return START_NOT_STICKY
+        when (intent?.action) {
+            ACTION_STOP -> {
+                stopSelf()
+                return START_NOT_STICKY
+            }
+            ACTION_SCREEN_OFF_PRIVILEGED -> {
+                if (!running) {
+                    postError("Mulai mirror dulu sebelum mengaktifkan layar OFF.")
+                    return START_NOT_STICKY
+                }
+                if (screenPowerController == null) {
+                    screenPowerController = ScreenPowerController(this) { message ->
+                        statusLine = message
+                        if (message.contains("aktif", ignoreCase = true)) {
+                            screenOffActive = true
+                        } else if (message.contains("dimatikan", ignoreCase = true)) {
+                            screenOffActive = false
+                        }
+                    }
+                }
+                screenOffActive = screenPowerController?.start() == true
+                return START_NOT_STICKY
+            }
+            ACTION_SCREEN_ON_PRIVILEGED -> {
+                screenPowerController?.stop(restoreScreen = true)
+                screenOffActive = false
+                return START_NOT_STICKY
+            }
         }
 
         if (projection != null) return START_NOT_STICKY
@@ -224,6 +253,9 @@ class MirrorService : Service() {
         destroyed = true
         running = false
         activeBroadcaster = null
+        try { screenPowerController?.stop(restoreScreen = true) } catch (_: Throwable) {}
+        screenPowerController = null
+        screenOffActive = false
         mainHandler.removeCallbacks(ticker)
         val r = renderer
         val stopThread = if (r != null) {
