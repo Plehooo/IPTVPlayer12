@@ -23,7 +23,9 @@ class H264Encoder(
     private val broadcaster: TsBroadcaster,
     private val onFailure: (Throwable) -> Unit,
     // Batas atas bitrate (mis. dari kecepatan link Wi-Fi). Nilai default = tanpa batas tambahan.
-    private val maxBitrate: Int = Int.MAX_VALUE
+    private val maxBitrate: Int = Int.MAX_VALUE,
+    // Dipanggil saat frame rate berubah otomatis (naik/turun mengikuti beban HP dan jaringan).
+    private val onQuality: ((String) -> Unit)? = null
 ) {
     /** Hasil penyesuaian permintaan resolusi/fps ke kemampuan encoder HP ini. */
     class Fit(val width: Int, val height: Int, val fps: Int, val note: String)
@@ -50,7 +52,31 @@ class H264Encoder(
     private var lastVideoPts90k = -1L
     private val aud = byteArrayOf(0, 0, 0, 1, 0x09, 0xF0.toByte())
 
+    // --- Adaptasi real-time (semua dihitung dari kondisi HP/jaringan saat ini, tidak terkunci angka tetap) ---
+    @Volatile private var activeFps = fps
+    private val fpsSteps: IntArray = buildFpsSteps(fps)
+    private var fpsIndex = 0
+    private var fpsChangeRequest = -1
+    private var lastFpsChangeNs = 0L
+    private var overloadSinceNs = Long.MIN_VALUE
+    private var steadySinceNs = Long.MIN_VALUE
+    private var pressureHoldUntilNs = 0L
+    @Volatile private var thermalStatus = 0
+    @Volatile private var thermalFactor = 1.0
+
     companion object {
+        private const val AUDIO_BPS = 128_000L
+
+        /** Tangga frame rate untuk naik/turun otomatis: dimulai dari permintaan, turun bertahap sampai 15 fps. */
+        private fun buildFpsSteps(requested: Int): IntArray {
+            val steps = ArrayList<Int>()
+            steps.add(requested)
+            for (candidate in intArrayOf(60, 30, 25, 20, 15)) {
+                if (candidate < requested && !steps.contains(candidate)) steps.add(candidate)
+            }
+            return steps.toIntArray()
+        }
+
         private val SIZE_LADDER = arrayOf(
             intArrayOf(1920, 1080),
             intArrayOf(1280, 720),
@@ -81,12 +107,10 @@ class H264Encoder(
             val perfClass = if (Build.VERSION.SDK_INT >= 31) Build.VERSION.MEDIA_PERFORMANCE_CLASS else 0
             return when {
                 lowRam || ramGb < 2.2 -> intArrayOf(848, 480, 25)
-                // 720p25 tetap jadi target otomatis untuk perangkat menengah yang cukup kuat;
-                // hardware encoder dipakai lewat Surface sehingga kualitas layar tidak perlu jatuh ke 540p
-                // hanya karena jumlah core < 8. Perangkat low-RAM tetap 480p.
-                ramGb < 4.0 || cores < 6 -> intArrayOf(960, 540, 25)
-                perfClass >= 31 || (ramGb >= 6.0 && cores >= 8) -> intArrayOf(1280, 720, 25)
-                else -> intArrayOf(960, 540, 25)
+                // Awal yang realistis; setelah itu adaptasi real-time (bitrate/fps) yang menentukan.
+                ramGb < 3.2 || cores < 6 -> intArrayOf(960, 540, 25)
+                perfClass >= 31 || (ramGb >= 5.0 && cores >= 8) -> intArrayOf(1280, 720, 30)
+                else -> intArrayOf(1280, 720, 25)
             }
         }
 
@@ -164,6 +188,7 @@ class H264Encoder(
         codec = createConfiguredCodec()
         inputSurface = codec!!.createInputSurface()
         codec!!.start()
+        publishQuality(false)
 
         projectionCallback = object : MediaProjection.Callback() {
             override fun onStop() {
@@ -187,7 +212,7 @@ class H264Encoder(
         running = true
         thread = Thread {
             // Thread encoder diberi prioritas tinggi supaya frame tetap mengalir saat aplikasi berat berjalan.
-            try { Process.setThreadPriority(Process.THREAD_PRIORITY_MORE_FAVORABLE) } catch (_: Throwable) {}
+            try { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY) } catch (_: Throwable) {}
             drainLoop()
         }.also {
             it.name = "A01-H264"
@@ -204,28 +229,28 @@ class H264Encoder(
             // Conservative live bitrates keep inexpensive Wi-Fi/DLNA renderers close to the live edge.
             // Quality is still high enough for UI/text at 720p while leaving headroom for audio + jitter.
             val bitrate = when {
-                width >= 1920 && fps >= 60 -> 5_500_000
+                width >= 1920 && activeFps >= 60 -> 5_500_000
                 width >= 1920 -> 4_200_000
-                width >= 1280 && fps >= 30 -> 2_700_000
+                width >= 1280 && activeFps >= 30 -> 2_700_000
                 width >= 1280 -> 2_500_000
                 width >= 960 -> 1_800_000
                 width >= 848 -> 1_450_000
                 width >= 640 -> 1_050_000
                 else -> 750_000
-            }.coerceAtMost(maxBitrate).coerceAtLeast(700_000)
+            }.coerceAtMost(maxBitrate).coerceAtLeast(minBitrate())
             baseBitrate = bitrate
             currentBitrate = bitrate
             broadcaster.setTargetVideoBitrate(bitrate)
             setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
-            setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+            setInteger(MediaFormat.KEY_FRAME_RATE, activeFps)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
             setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 200_000L)
             if (strict) {
                 setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
                 setInteger(MediaFormat.KEY_PRIORITY, 0)
                 setInteger(MediaFormat.KEY_LATENCY, 0)
-                setInteger(MediaFormat.KEY_OPERATING_RATE, fps)
-                setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, fps.toFloat())
+                setInteger(MediaFormat.KEY_OPERATING_RATE, activeFps)
+                setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, activeFps.toFloat())
                 setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileMain)
                 setInteger(MediaFormat.KEY_LEVEL, avcLevel())
                 val frameDropCbr = if (Build.VERSION.SDK_INT >= 31 &&
@@ -241,7 +266,7 @@ class H264Encoder(
 
     private fun avcLevel(): Int {
         val mbs = ((width + 15) / 16) * ((height + 15) / 16)
-        val rate = mbs * fps
+        val rate = mbs * activeFps
         return when {
             mbs <= 3600 && rate <= 108_000 -> MediaCodecInfo.CodecProfileLevel.AVCLevel31
             mbs <= 5120 && rate <= 216_000 -> MediaCodecInfo.CodecProfileLevel.AVCLevel32
@@ -352,6 +377,14 @@ class H264Encoder(
                 if (broadcaster.consumeKeyFrameRequest()) {
                     if (!requestSyncFrame(c, System.nanoTime(), 250_000_000L)) broadcaster.requestKeyFrame()
                 }
+                if (fpsChangeRequest >= 0) {
+                    // Ganti frame rate = buat ulang codec (sesi MediaProjection tetap); resolusi tidak berubah
+                    // sehingga decoder STB tidak perlu inisialisasi ulang ukuran gambar.
+                    val step = fpsChangeRequest
+                    fpsChangeRequest = -1
+                    applyFpsStep(step)
+                    continue
+                }
                 when (val index = c.dequeueOutputBuffer(info, 10_000)) {
                     MediaCodec.INFO_TRY_AGAIN_LATER -> Unit
                     MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
@@ -403,7 +436,9 @@ class H264Encoder(
                                     val clientDrops = broadcaster.droppedClientPackets
                                     val networkPressure = clientDrops != lastClientDrops
                                     lastClientDrops = clientDrops
+                                    if (networkPressure) pressureHoldUntilNs = nowNs + 1_500_000_000L
                                     maybeAdaptBitrate(c, lagUs, nowNs, networkPressure)
+                                    evaluateFps(nowNs, lagUs)
 
                                     // Frame P tidak lagi dibuang di sini (membuat blok artefak). Kalau jaringan
                                     // tak sanggup, lapisan kirim yang meminta IDR baru dan resync bersih.
@@ -445,49 +480,146 @@ class H264Encoder(
         return true
     }
 
+    /** Batas bawah bitrate mengikuti resolusi (bukan angka tetap untuk semua HP). */
+    private fun minBitrate(): Int = when {
+        width >= 1920 -> 1_200_000
+        width >= 1280 -> 800_000
+        width >= 960 -> 600_000
+        else -> 450_000
+    }
+
+    /**
+     * Dipanggil MirrorService dari listener suhu HP. Panas => plafon bitrate turun (dan fps bisa turun);
+     * setelah dingin plafon naik kembali.
+     */
+    fun setThermalStatus(status: Int) {
+        thermalStatus = status
+        thermalFactor = when {
+            status >= 4 -> 0.45
+            status == 3 -> 0.6
+            status == 2 -> 0.8
+            else -> 1.0
+        }
+    }
+
+    private fun applyBitrate(c: MediaCodec, next: Int, nowNs: Long) {
+        try {
+            c.setParameters(Bundle().apply {
+                putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, next)
+            })
+            currentBitrate = next
+            broadcaster.setTargetVideoBitrate(next)
+        } catch (_: Throwable) {
+        }
+        lastBitrateChangeNs = nowNs
+    }
+
+    /**
+     * Bitrate naik-turun real-time dari tiga sumber: (1) kecepatan kirim yang benar-benar terukur ke STB,
+     * (2) keterlambatan encoder (CPU/GPU HP sedang dipakai aplikasi berat), (3) suhu HP. Turun cepat,
+     * naik pelan (probing 15% tiap ≥4 dtk saat sehat) sehingga tidak berosilasi.
+     */
     private fun maybeAdaptBitrate(c: MediaCodec, lagUs: Long, nowNs: Long, networkPressure: Boolean) {
+        val floor = minBitrate()
+        val ceiling = maxOf(floor, (baseBitrate * thermalFactor).toInt())
+        val goodput = broadcaster.measuredGoodputBps()
+        val linkLimit = if (goodput > 0L) {
+            (goodput * 8L / 10L - AUDIO_BPS).coerceIn(floor.toLong(), Int.MAX_VALUE.toLong()).toInt()
+        } else {
+            Int.MAX_VALUE
+        }
         val tooLate = lateStreak >= 3 || lagUs >= 300_000L || networkPressure
-        if (tooLate && nowNs - lastBitrateChangeNs > 1_200_000_000L) {
-            val floor = when {
-                width >= 1920 -> 1_900_000
-                width >= 1280 -> 1_450_000
-                width >= 960 -> 1_050_000
-                width >= 848 -> 900_000
-                else -> 700_000
-            }
-            val next = (currentBitrate * 0.82).toInt().coerceAtLeast(floor)
-            if (next < currentBitrate) {
-                try {
-                    c.setParameters(Bundle().apply {
-                        putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, next)
-                    })
-                    currentBitrate = next
-                    broadcaster.setTargetVideoBitrate(next)
-                    lastBitrateChangeNs = nowNs
-                    healthySinceNs = Long.MIN_VALUE
-                } catch (_: Throwable) {
-                    lastBitrateChangeNs = nowNs
-                }
+        val sinceChange = nowNs - lastBitrateChangeNs
+
+        var target = currentBitrate
+        if (currentBitrate > ceiling) target = ceiling
+        if (currentBitrate > linkLimit) target = minOf(target, linkLimit)
+        if (tooLate) target = minOf(target, (currentBitrate * 0.82).toInt())
+        target = target.coerceAtLeast(floor)
+
+        if (target < currentBitrate) {
+            if (sinceChange > 1_000_000_000L) {
+                applyBitrate(c, target, nowNs)
+                healthySinceNs = Long.MIN_VALUE
             }
             return
         }
 
-        if (currentBitrate < baseBitrate &&
+        if (currentBitrate < ceiling &&
             healthySinceNs != Long.MIN_VALUE &&
             nowNs - healthySinceNs > 4_000_000_000L &&
-            nowNs - lastBitrateChangeNs > 4_000_000_000L
+            sinceChange > 4_000_000_000L
         ) {
-            val next = minOf(baseBitrate, (currentBitrate * 1.20).toInt())
-            try {
-                c.setParameters(Bundle().apply {
-                    putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, next)
-                })
-                currentBitrate = next
-                broadcaster.setTargetVideoBitrate(next)
-                lastBitrateChangeNs = nowNs
+            var up = minOf(ceiling, (currentBitrate * 1.15).toInt())
+            if (goodput > 0L) up = minOf(up, linkLimit)
+            if (up > currentBitrate) {
+                applyBitrate(c, up, nowNs)
                 healthySinceNs = nowNs
+            }
+        }
+    }
+
+    /**
+     * Frame rate naik-turun otomatis: turun bila encoder terus tertinggal / jaringan tetap tertekan / HP
+     * terlalu panas (≥3 dtk berturut-turut, jeda ≥10 dtk antar perubahan); naik lagi bila sehat ≥30 dtk.
+     */
+    private fun evaluateFps(nowNs: Long, lagUs: Long) {
+        if (fpsSteps.size <= 1 || fpsChangeRequest >= 0) return
+        val pressureActive = nowNs < pressureHoldUntilNs
+        val overloaded = lagUs >= 400_000L || lateStreak >= 6 || thermalStatus >= 3 ||
+            (pressureActive && currentBitrate * 10 <= baseBitrate * 6)
+
+        if (overloaded) {
+            steadySinceNs = Long.MIN_VALUE
+            if (overloadSinceNs == Long.MIN_VALUE) overloadSinceNs = nowNs
+            if (nowNs - overloadSinceNs >= 3_000_000_000L &&
+                nowNs - lastFpsChangeNs >= 10_000_000_000L &&
+                fpsIndex < fpsSteps.size - 1
+            ) {
+                fpsChangeRequest = fpsIndex + 1
+            }
+            return
+        }
+
+        overloadSinceNs = Long.MIN_VALUE
+        val healthy = lagUs < 90_000L && lateStreak == 0 && thermalStatus < 2 &&
+            !pressureActive && currentBitrate * 100 >= baseBitrate * 95
+        if (!healthy) {
+            steadySinceNs = Long.MIN_VALUE
+            return
+        }
+        if (steadySinceNs == Long.MIN_VALUE) steadySinceNs = nowNs
+        if (fpsIndex > 0 &&
+            nowNs - steadySinceNs >= 30_000_000_000L &&
+            nowNs - lastFpsChangeNs >= 30_000_000_000L
+        ) {
+            fpsChangeRequest = fpsIndex - 1
+        }
+    }
+
+    private fun applyFpsStep(index: Int) {
+        val safeIndex = index.coerceIn(0, fpsSteps.size - 1)
+        val target = fpsSteps[safeIndex]
+        if (target == activeFps) return
+        val previous = activeFps
+        activeFps = target
+        fpsIndex = safeIndex
+        lastFpsChangeNs = System.nanoTime()
+        overloadSinceNs = Long.MIN_VALUE
+        steadySinceNs = Long.MIN_VALUE
+        if (!recoverCodec()) {
+            activeFps = previous
+            throw IllegalStateException("Gagal mengganti frame rate ke $target fps")
+        }
+        publishQuality(true)
+    }
+
+    private fun publishQuality(changed: Boolean) {
+        broadcaster.updateLiveQuality("${width}×${height} • ${activeFps} fps")
+        if (changed) {
+            try {
+                onQuality?.invoke("Frame rate disesuaikan otomatis: ${activeFps} fps (mengikuti beban HP/jaringan).")
             } catch (_: Throwable) {
-                lastBitrateChangeNs = nowNs
             }
         }
     }

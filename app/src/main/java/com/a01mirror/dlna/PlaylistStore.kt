@@ -1,9 +1,10 @@
 package com.a01mirror.dlna
 
 import android.content.Context
+import java.io.BufferedReader
+import java.io.StringReader
 import org.json.JSONArray
 import org.json.JSONObject
-import java.nio.charset.StandardCharsets
 
 /** Lightweight M3U playlist model/parser. Keeps the main DLNA/mirroring pipeline independent. */
 data class PlaylistItem(
@@ -65,47 +66,39 @@ object PlaylistStore {
         }
     }
 
+    private val GROUP_RE = Regex("(?:^|\\s)group-title\\s*=\\s*\"([^\"]*)\"", RegexOption.IGNORE_CASE)
+    private val LOGO_RE = Regex("(?:^|\\s)tvg-logo\\s*=\\s*\"([^\"]*)\"", RegexOption.IGNORE_CASE)
+
+    /** Kompatibel dengan versi lama: memproses teks utuh lewat parser streaming. */
+    fun parse(text: String, baseUrl: String = ""): List<PlaylistItem> =
+        parseReader(BufferedReader(StringReader(text)), baseUrl)
+
     /**
-     * Parses common #EXTM3U/#EXTINF files. It intentionally accepts loose playlists found in IPTV
-     * lists while keeping a hard limit so a broken URL cannot allocate unbounded memory.
+     * Parser streaming #EXTM3U/#EXTINF: membaca baris demi baris, jadi RAM yang dipakai hanya item hasil
+     * parse (bukan salinan teks 16 MB berkali-kali). Menerima daftar IPTV yang longgar, dengan batas
+     * jumlah item dan batas ukuran agar URL rusak tidak bisa memakan memori tanpa batas.
      */
-    fun parse(text: String, baseUrl: String = ""): List<PlaylistItem> {
-        val lines = text.removePrefix("\uFEFF").lineSequence()
-            .map { it.trim().trimStart('\uFEFF') }
-            .filter { it.isNotEmpty() }
-            .toList()
-        val out = ArrayList<PlaylistItem>(minOf(lines.size / 2, MAX_ITEMS))
+    fun parseReader(
+        reader: BufferedReader,
+        baseUrl: String = "",
+        maxChars: Long = 16L * 1024L * 1024L
+    ): List<PlaylistItem> {
+        val out = ArrayList<PlaylistItem>(256)
         var pendingName = ""
         var pendingGroup = ""
         var pendingLogo = ""
+        var total = 0L
 
-        fun attr(line: String, key: String): String {
-            val regex = Regex("(?:^|\\s)$key\\s*=\\s*\"([^\"]*)\"", RegexOption.IGNORE_CASE)
-            return regex.find(line)?.groupValues?.getOrNull(1).orEmpty()
-        }
-
-        fun looksLikeHlsManifest(value: String): Boolean =
-            value.contains("#EXT-X-TARGETDURATION", true) ||
-                value.contains("#EXT-X-MEDIA-SEQUENCE", true) ||
-                value.contains("#EXT-X-STREAM-INF", true) ||
-                value.contains("#EXT-X-ENDLIST", true)
-
-        fun looksLikeDashManifest(value: String): Boolean =
-            value.contains("<MPD", true) && value.contains("</MPD", true)
-
-        if (looksLikeDashManifest(text)) {
-            val label = baseUrl.substringAfterLast('/').substringBefore('?').ifBlank { "DASH Stream" }
-            return listOf(PlaylistItem("DASH • $label", baseUrl))
-        }
-        if (looksLikeHlsManifest(text)) {
-            val label = baseUrl.substringAfterLast('/').substringBefore('?').ifBlank { "HLS Stream" }
-            return listOf(PlaylistItem("HLS • $label", baseUrl))
-        }
-
-
+        // Judul EXTINF = teks setelah koma PERTAMA di luar tanda kutip. Koma di dalam atribut
+        // (mis. tvg-name="RCTI, HD") tidak lagi memotong nama channel.
         fun titleFromExtinf(line: String): String {
-            val comma = line.indexOf(',')
-            return if (comma >= 0) line.substring(comma + 1).trim() else ""
+            var inQuote = false
+            for (i in line.indices) {
+                val ch = line[i]
+                if (ch == '"') inQuote = !inQuote
+                else if (ch == ',' && !inQuote) return line.substring(i + 1).trim()
+            }
+            return ""
         }
 
         fun resolveUrl(raw: String): String {
@@ -120,19 +113,41 @@ object PlaylistStore {
             }
         }
 
-        for (line in lines) {
+        while (true) {
+            val raw = reader.readLine() ?: break
+            total += raw.length + 1L
+            if (total > maxChars) throw IllegalStateException("playlist terlalu besar (>${maxChars / 1048576L} MB)")
+            val line = raw.trim().trimStart('\uFEFF')
+            if (line.isEmpty()) continue
+
+            // Manifest tunggal (bukan daftar channel): tag-nya selalu muncul sebelum URL apa pun.
+            if (line.startsWith("<") && line.contains("<MPD", true)) {
+                val label = baseUrl.substringAfterLast('/').substringBefore('?').ifBlank { "DASH Stream" }
+                return listOf(PlaylistItem("DASH • $label", baseUrl))
+            }
+            if (line.startsWith("#EXT-X-TARGETDURATION", true) ||
+                line.startsWith("#EXT-X-MEDIA-SEQUENCE", true) ||
+                line.startsWith("#EXT-X-STREAM-INF", true) ||
+                line.startsWith("#EXT-X-ENDLIST", true)
+            ) {
+                val label = baseUrl.substringAfterLast('/').substringBefore('?').ifBlank { "HLS Stream" }
+                return listOf(PlaylistItem("HLS • $label", baseUrl))
+            }
+
             when {
                 line.startsWith("#EXTINF", true) -> {
                     pendingName = titleFromExtinf(line)
-                    pendingGroup = attr(line, "group-title")
-                    pendingLogo = attr(line, "tvg-logo")
+                    pendingGroup = GROUP_RE.find(line)?.groupValues?.getOrNull(1).orEmpty()
+                    pendingLogo = LOGO_RE.find(line)?.groupValues?.getOrNull(1).orEmpty()
                 }
                 line.startsWith("#EXTGRP:", true) -> pendingGroup = line.substringAfter(':').trim()
                 line.startsWith("#") -> Unit
                 else -> {
                     val url = resolveUrl(line)
                     if ((url.startsWith("http://", true) || url.startsWith("https://", true)) && out.size < MAX_ITEMS) {
-                        val name = pendingName.ifBlank { url.substringAfterLast('/').substringBefore('?').ifBlank { "Channel ${out.size + 1}" } }
+                        val name = pendingName.ifBlank {
+                            url.substringAfterLast('/').substringBefore('?').ifBlank { "Channel ${out.size + 1}" }
+                        }
                         out += PlaylistItem(name, url, pendingGroup, pendingLogo)
                     }
                     pendingName = ""

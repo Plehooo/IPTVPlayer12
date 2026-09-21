@@ -139,3 +139,30 @@ Semua bersifat tambahan; tidak ada file/fitur yang dihapus.
 - URL direct dengan suffix media tambahan (M4V, M2TS, MPEG-TS, AC3/E-AC3, WAV, OGG/Opus) dikenali tanpa mengubah pipeline DLNA.
 - Playlist memakai ListView + recycling, sehingga ribuan item tetap dapat di-scroll tanpa membuat ribuan Button sekaligus.
 - HLS/M3U8 dan DASH/MPD tetap dapat dikirim langsung bila renderer menerima format tersebut; renderer A01 tetap menentukan codec/fitur yang benar-benar dapat diputar.
+
+
+## Update 1.7.0 — adaptif real-time (video + audio MP3 mulus, ringan RAM)
+
+Tidak ada file/fitur yang dihapus dan struktur kelas tidak berubah; semua bersifat perbaikan/penambahan.
+
+**Naik-turun otomatis mengikuti HP dan jaringan (tanpa angka yang dikunci):**
+- Bitrate video disetel real-time dari tiga sumber: kecepatan kirim yang *terukur* ke STB (`TsBroadcaster.measuredGoodputBps()`), keterlambatan encoder saat CPU/GPU dipakai aplikasi berat (YouTube/game), dan suhu HP (`PowerManager` thermal status). Turun cepat, naik pelan (probing 15% tiap ≥4 dtk saat sehat). Batas bawah mengikuti resolusi.
+- Frame rate juga naik-turun otomatis (tangga 60→30→25→20→15 fps sesuai permintaan awal): turun bila encoder terus tertinggal / jaringan tetap tertekan / HP terlalu panas ≥3 dtk, naik lagi setelah sehat ≥30 dtk. Resolusi tidak berubah di tengah stream (decoder STB murah tidak mau inisialisasi ulang ukuran gambar). Kualitas aktif tampil di layar Live.
+- Mode Otomatis: profil awal 720p untuk HP menengah (perbaikan: 1.6.0 salah memilih 540p untuk sebagian besar HP 4–6 GB), 720p30 hanya HP kuat, 540p/480p untuk HP lemah.
+
+**Video tidak macet / tidak glitch:**
+- Pengiriman ke STB ditulis ulang: state pengiriman hanya disentuh satu thread (menghilangkan race yang bisa menutup koneksi), audio+tabel selalu dikirim lebih dulu dari video, IDR tidak pernah dipotong di tengah jalan, pacing 2× (4× saat IDR/backlog) sehingga IDR besar tidak memicu resync berulang. Umur frame dinilai hanya saat mulai dikirim.
+- Simulasi aturan 1.6.0 vs 1.7.0 (IDR 20–45% dari bit satu GOP): 1.6.0 masuk putaran resync (fps efektif 0–2), 1.7.0 tetap 25 fps.
+- Prioritas thread encoder dan pengirim dikembalikan (URGENT_DISPLAY / DISPLAY); thread rekaman prioritas normal.
+- PCR 100 ms lebih awal dari PTS (bantalan kecil untuk STB murah).
+
+**Audio MP3 tidak ngeglitch:**
+- Frame MP3 senyap: indeks sample-rate diperbaiki (00=44,1 kHz, 01=48 kHz, 10=32 kHz; diverifikasi ffprobe).
+- Sumber mono di-upmix ke stereo (sebelumnya LAME membaca tiap sampel kedua = audio 2× cepat).
+- PTS audio dikoreksi halus dan disejajarkan langsung bila selisih >200 ms; audio tidak lagi dibuang karena "tertinggal dari video".
+- LAME memakai preset cepat (7) di HP lemah, preset 5 di HP kuat.
+
+**Ringan RAM/CPU:**
+- Antrean rekaman mengikuti heap HP (3–12 MB, bukan 16 MB tetap).
+- Playlist di-parse streaming baris demi baris (tidak lagi String 16 MB + salinan); koma di dalam atribut `#EXTINF` tidak memotong nama channel.
+- Thread pengirim tidur/bangun (park/unpark) saat idle, bukan polling.

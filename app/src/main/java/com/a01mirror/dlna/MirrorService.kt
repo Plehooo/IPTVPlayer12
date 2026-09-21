@@ -53,6 +53,7 @@ class MirrorService : Service() {
     private var wifiLock: android.net.wifi.WifiManager.WifiLock? = null
     private var wifiHighPerfLock: android.net.wifi.WifiManager.WifiLock? = null
     private var cpuWakeLock: android.os.PowerManager.WakeLock? = null
+    private var thermalListener: android.os.PowerManager.OnThermalStatusChangedListener? = null
 
     private val mainHandler = Handler(Looper.getMainLooper())
     @Volatile private var destroyed = false
@@ -145,8 +146,22 @@ class MirrorService : Service() {
                 onFailure = {
                     postError("Video: ${it.message ?: "gagal"}")
                     stopSelf()
-                }
+                },
+                onQuality = { statusLine = it }
             ).also { it.start() }
+
+            // Suhu HP: saat panas, bitrate/fps diturunkan otomatis dan naik lagi setelah dingin.
+            try {
+                val power = getSystemService(android.os.PowerManager::class.java)
+                val listener = android.os.PowerManager.OnThermalStatusChangedListener { status ->
+                    encoder?.setThermalStatus(status)
+                }
+                power.addThermalStatusListener(mainExecutor, listener)
+                thermalListener = listener
+                encoder?.setThermalStatus(power.currentThermalStatus)
+            } catch (_: Throwable) {
+                thermalListener = null
+            }
 
             audio = AudioCapture(
                 projection = projection!!,
@@ -216,6 +231,11 @@ class MirrorService : Service() {
                 .also { it.name = "A01-DLNA-stop"; it.start() }
         } else null
         try { mirrorThread?.interrupt() } catch (_: Exception) {}
+        try {
+            thermalListener?.let { getSystemService(android.os.PowerManager::class.java).removeThermalStatusListener(it) }
+        } catch (_: Throwable) {
+        }
+        thermalListener = null
         try { audio?.stop() } catch (_: Exception) {}
         audio = null
         try { encoder?.stop() } catch (_: Exception) {}

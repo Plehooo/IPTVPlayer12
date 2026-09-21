@@ -77,10 +77,10 @@ class AudioCapture(
         lame = try {
             LameBuilder()
             .setInSampleRate(sampleRate)
-            .setOutChannels(channels)
+            .setOutChannels(2) // selalu stereo; sumber mono di-upmix di loop()
             .setOutBitrate(128)
             .setOutSampleRate(sampleRate)
-            .setQuality(5)
+            .setQuality(lameQuality())
             .build()
         } catch (t: Throwable) {
             // Library MP3 native tidak bisa dimuat di ABI HP ini: tetap siarkan video + audio senyap.
@@ -114,6 +114,9 @@ class AudioCapture(
         // Batch ini menjaga encoder/network tetap irit wake-up tanpa membuat audio menunggu ratusan ms.
         val framesPerRead = 1152
         val pcm = ShortArray(framesPerRead * channels)
+        // encodeBufferInterLeaved selalu mengasumsikan PCM stereo; sumber mono digandakan ke L/R
+        // (kalau tidak, LAME membaca tiap sampel kedua dan audio terdengar 2x lebih cepat).
+        val stereo = if (channels == 1) ShortArray(framesPerRead * 2) else null
         val mp3 = ByteArray(12_288 + pcm.size * 2)
         var samplesPerChannel = 0L
         var lastPts90k = 0L
@@ -144,7 +147,17 @@ class AudioCapture(
                     continue
                 }
                 val perChannel = shorts / channels
-                val encoded = enc.encodeBufferInterLeaved(pcm, perChannel, mp3)
+                val input = if (stereo != null) {
+                    for (i in 0 until perChannel) {
+                        val sample = pcm[i]
+                        stereo[2 * i] = sample
+                        stereo[2 * i + 1] = sample
+                    }
+                    stereo
+                } else {
+                    pcm
+                }
+                val encoded = enc.encodeBufferInterLeaved(input, perChannel, mp3)
 
                 // Koreksi clock kira-kira 4× per detik. Jangan koreksi setiap frame karena itu bisa
                 // membuat PTS loncat-loncat dan terdengar seperti audio patah.
@@ -155,10 +168,15 @@ class AudioCapture(
                 ) {
                     val candidateOriginNs = audioTimestamp.nanoTime -
                         (audioTimestamp.framePosition * 1_000_000_000L / sampleRate)
-                    // Koreksi perlahan; maksimal 2 ms per update agar tidak menghasilkan timestamp spike.
                     val currentOrigin = audioOriginNs
-                    val correction = (candidateOriginNs - currentOrigin).coerceIn(-500_000L, 500_000L)
-                    audioOriginNs = currentOrigin + correction
+                    val error = candidateOriginNs - currentOrigin
+                    // Selisih kecil dikoreksi halus (maks 4 ms per 250 ms); selisih besar (>200 ms, mis. audio
+                    // sempat tertahan CPU) langsung disejajarkan supaya audio tidak tertinggal dari video terus-menerus.
+                    audioOriginNs = if (error > 200_000_000L || error < -200_000_000L) {
+                        candidateOriginNs
+                    } else {
+                        currentOrigin + (error / 4L).coerceIn(-4_000_000L, 4_000_000L)
+                    }
                     anchor90k = (audioOriginNs - broadcaster.clockOriginNs).coerceAtLeast(0L) * 90_000L / 1_000_000_000L
                     lastTimestampCheckNs = nowNs
                 }
@@ -212,11 +230,19 @@ class AudioCapture(
         }
     }
 
+    /** HP lemah (inti sedikit / heap kecil) memakai preset LAME yang lebih cepat agar encoder MP3 ringan. */
+    private fun lameQuality(): Int {
+        val weak = Runtime.getRuntime().availableProcessors() < 6 ||
+            Runtime.getRuntime().maxMemory() < 200L * 1024L * 1024L
+        return if (weak) 7 else 5
+    }
+
     /** Satu frame MPEG-1 Layer III senyap; header sample-rate harus cocok dengan frame sebenarnya. */
     private fun silentFrame(rate: Int): ByteArray {
+        // Tabel MPEG-1: 00 = 44,1 kHz, 01 = 48 kHz, 10 = 32 kHz (diverifikasi dengan ffprobe).
         val rateIndex = when (rate) {
-            48000 -> 0
-            44100 -> 1
+            44100 -> 0
+            48000 -> 1
             else -> 2
         }
         val bitrateIndex = 9 // 128 kbps pada MPEG-1 Layer III.

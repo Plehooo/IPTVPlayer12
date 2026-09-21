@@ -19,10 +19,10 @@ class MpegTsMuxer {
         private const val PROGRAM_NUMBER = 1
         private const val PES_HEADER_SIZE = 14
 
-        // PCR mengikuti PTS video pada jalur live. PCR ditempatkan pada paket TS pertama setiap
-        // access-unit video (≈ setiap frame), jauh lebih rapat daripada interval minimum sehingga
-        // clock renderer murah tetap terkunci ke video tanpa menunggu blok besar.
-        private const val PCR_LEAD_90K = 0L
+        // PCR ditempatkan pada paket TS pertama tiap access-unit video (≈ tiap frame) dan dibuat 100 ms
+        // lebih awal dari PTS: decoder STB murah punya bantalan kecil (PTS - PCR > 0) sehingga frame yang
+        // tiba sedikit terlambat karena Wi-Fi/CPU tidak langsung dianggap basi dan dibuang.
+        private const val PCR_LEAD_90K = 9_000L
     }
 
     private val continuity = HashMap<Int, Int>()

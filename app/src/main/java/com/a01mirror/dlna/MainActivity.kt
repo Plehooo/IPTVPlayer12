@@ -562,21 +562,10 @@ class MainActivity : Activity() {
                         val code = connection.responseCode
                         if (code !in 200..299) throw IllegalStateException("HTTP $code")
                         val finalUrl = connection.url?.toString().orEmpty().ifBlank { url }
-                        val text = connection.inputStream.use { input ->
-                            val reader = input.bufferedReader(StandardCharsets.UTF_8)
-                            val buffer = CharArray(8192)
-                            val out = StringBuilder()
-                            var total = 0
-                            while (true) {
-                                val read = reader.read(buffer)
-                                if (read <= 0) break
-                                total += read
-                                if (total > 16 * 1024 * 1024) throw IllegalStateException("playlist terlalu besar (>16 MB)")
-                                out.append(buffer, 0, read)
-                            }
-                            out.toString()
+                        // Streaming: playlist besar tidak lagi dimuat utuh ke RAM (sebelumnya String 16 MB + salinan).
+                        parsed = connection.inputStream.bufferedReader(StandardCharsets.UTF_8).use { reader ->
+                            PlaylistStore.parseReader(reader, finalUrl)
                         }
-                        parsed = PlaylistStore.parse(text, finalUrl)
                     } finally {
                         connection.disconnect()
                     }
@@ -723,6 +712,10 @@ class MainActivity : Activity() {
             liveText.text = buildString {
                 append("Video  : ").append(b.videoFrames).append(" frame • ")
                     .append(String.format(Locale.US, "%.2f Mbps", mbps)).append('\n')
+                if (b.liveQuality.isNotEmpty()) {
+                    append("Kualitas: ").append(b.liveQuality).append(" • target ")
+                        .append(String.format(Locale.US, "%.1f Mbps", b.videoBitrateTarget / 1_000_000.0)).append('\n')
+                }
                 append("STB    : ").append(b.clientCount).append(" terhubung\n")
                 append("Drop   : ").append(b.droppedClientPackets).append(" video • ")
                     .append(b.droppedClientAudioPackets).append(" audio\n")
