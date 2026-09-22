@@ -16,8 +16,8 @@ import java.nio.ByteBuffer
 
 class H264Encoder(
     private val projection: MediaProjection,
-    private val width: Int,
-    private val height: Int,
+    private var width: Int,
+    private var height: Int,
     private val fps: Int,
     private val densityDpi: Int,
     private val broadcaster: TsBroadcaster,
@@ -58,6 +58,9 @@ class H264Encoder(
     private var fpsIndex = 0
     private var fpsChangeRequest = -1
     private var lastFpsChangeNs = 0L
+    // Diisi dari MediaProjection.Callback.onCapturedContentResize() (API 34+) saat konten yang
+    // ditangkap berubah ukuran (mis. rotasi layar). Diproses di drainLoop, bukan di thread callback.
+    @Volatile private var pendingContentResize: IntArray? = null
     private var overloadSinceNs = Long.MIN_VALUE
     private var steadySinceNs = Long.MIN_VALUE
     private var pressureHoldUntilNs = 0L
@@ -194,6 +197,15 @@ class H264Encoder(
             override fun onStop() {
                 running = false
                 try { onFailure(IllegalStateException("Screen capture dihentikan oleh sistem.")) } catch (_: Exception) {}
+            }
+
+            // API 34+: dipanggil saat dimensi konten yang ditangkap berubah (mis. rotasi layar
+            // potret/lanskap). Tanpa ini, VirtualDisplay tetap pada resolusi lama sehingga gambar
+            // yang dikirim ke STB menjadi terdistorsi/letterboxed setelah HP diputar.
+            override fun onCapturedContentResize(newWidth: Int, newHeight: Int) {
+                if (newWidth > 0 && newHeight > 0 && (newWidth != width || newHeight != height)) {
+                    pendingContentResize = intArrayOf(newWidth, newHeight)
+                }
             }
         }
         projection.registerCallback(projectionCallback!!, null)
@@ -383,6 +395,12 @@ class H264Encoder(
                     val step = fpsChangeRequest
                     fpsChangeRequest = -1
                     applyFpsStep(step)
+                    continue
+                }
+                val resize = pendingContentResize
+                if (resize != null) {
+                    pendingContentResize = null
+                    applyContentResize(resize[0], resize[1])
                     continue
                 }
                 when (val index = c.dequeueOutputBuffer(info, 10_000)) {
@@ -656,6 +674,50 @@ class H264Encoder(
             true
         } catch (_: Throwable) {
             false
+        }
+    }
+
+    /**
+     * Konten yang ditangkap berubah ukuran (mis. rotasi layar). Sesuaikan lagi ke kemampuan
+     * encoder HP ini (sama seperti start()), lalu buat ulang codec+surface dan resize
+     * VirtualDisplay agar tidak ada frame yang terdistorsi/letterboxed dikirim ke STB.
+     */
+    @Synchronized
+    private fun applyContentResize(newWidth: Int, newHeight: Int) {
+        if (!running) return
+        try {
+            val fit = fitToDevice(newWidth, newHeight, activeFps)
+            width = fit.width
+            height = fit.height
+
+            broadcaster.resetLiveForCodecRecovery()
+
+            val oldCodec = codec
+            val oldSurface = inputSurface
+            codec = null
+            inputSurface = null
+            try { oldSurface?.release() } catch (_: Exception) {}
+            try { oldCodec?.stop() } catch (_: Exception) {}
+            try { oldCodec?.release() } catch (_: Exception) {}
+
+            val replacement = createConfiguredCodec()
+            val replacementSurface = replacement.createInputSurface()
+            replacement.start()
+            codec = replacement
+            inputSurface = replacementSurface
+            try { virtualDisplay?.resize(width, height, densityDpi) } catch (_: Throwable) {}
+            virtualDisplay?.setSurface(replacementSurface)
+
+            sps = null
+            pps = null
+            resetClock()
+            lastSyncRequestNs = 0L
+            lastClientDrops = broadcaster.droppedClientPackets
+            recoveries++
+            publishQuality(false)
+            requestSyncFrame(replacement, System.nanoTime())
+        } catch (t: Throwable) {
+            try { onFailure(t) } catch (_: Exception) {}
         }
     }
 
